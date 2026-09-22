@@ -1,0 +1,16 @@
+# Models are independently configurable by role. The default keeps every
+# role on the same gateway model while preserving the multi-agent separation.
+[agents.rubric-author]
+model = "aiaaa/deepseek-v4.1-flash#high"
+
+[agents.rubric-reviewer]
+model = "aiaaa/deepseek-v4.1-flash#high"
+
+[agents.rubric-review-classifier]
+model = "aiaaa/deepseek-v4.1-flash#high"
+
+[agents.rubric-arbitrator]
+model = "aiaaa/deepseek-v4.1-flash#high"
+
+[agents.rubric-orchestrator]
+model = "aiaaa/deepseek-v4.1-flash#high"

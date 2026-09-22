@@ -1,0 +1,6 @@
+interface:
+  display_name: "AI Agent Rubric 制作"
+  short_description: "先审题复算锚点，再形成逐题可计算、可追溯的 Rubric"
+  default_prompt: "Use $ai-agent-rubric-authoring to solve-to-audit the task, verify source-backed anchors, and create or audit a task-specific deterministic rubric without forcing a generic template."
+policy:
+  allow_implicit_invocation: true

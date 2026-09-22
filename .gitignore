@@ -1,0 +1,23 @@
+# Local model/provider configuration and credentials
+opencode.jsonc
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+
+# Runtime outputs
+.rubric-generator/
+regression/runs/
+测试数据集/
+private-test-data/
+test-artifacts/
+fixtures/private/
+work/
+DeepInsight测试数据集/
+
+# Office temporary files
+~$*
+*.bak
