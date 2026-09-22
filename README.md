@@ -22,8 +22,8 @@
 3. 程序检查 ID、六组权重、状态函数、真实输入路径及 record/spec 对齐，然后确定性渲染候选 `rubric.md`。
 4. Reviewer 独立核查题意、锚点、可计算性、开放答案公平性和自包含性。
 5. Reviewer 已判定通过但仍有 suggestions 时，独立 Classification Gate 才复核其严重性；只有存在具体、可复现评分后果的项目才提升为 blocking。
-6. 最多一轮定向修改；仍有阻断分歧时由 Arbitrator 作一次绑定裁决。
-7. 通过最终静态检查后原子写入题目目录；中间文件留在项目运行目录。
+6. 最多一轮定向修改；仍有阻断分歧时由 Arbitrator 作一次绑定裁决。裁决后只生成并应用最小 JSON Patch，不重新输出整份大型 record/spec。
+7. 每个通过机器校验的阶段立即保存为检查点；通过最终静态检查后原子写入题目目录，中间文件留在项目运行目录。
 
 Reviewer 只报告会造成错误评分或无法可靠执行的问题。措辞、排版偏好和“为了更完整”的新增要求不能成为阻断项。
 
@@ -79,6 +79,16 @@ uv run rubric-generator generate \
 ```
 
 默认跳过已有 `rubric.md`。确认需要重做时加 `--force`；原版本会备份到当次运行留痕中。
+
+某次运行中断或后期校验失败时，可用原 run ID 从已校验检查点继续。已经完成的审题、规格、审核、修改和裁决不会再次调用模型：
+
+```bash
+uv run rubric-generator resume \
+  --dataset "D:/path/to/测试数据集" \
+  --run-id "20260922-174236" \
+  --task-pattern "1_AI_Agent产品对比研究" \
+  --concurrency 1
+```
 
 只读审计已有 Rubric：
 

@@ -31,6 +31,14 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--limit", type=int)
     generate.add_argument("--timeout", type=int, default=900)
 
+    resume = sub.add_parser("resume", help="从已有运行的已校验检查点继续")
+    resume.add_argument("--dataset", type=Path, required=True)
+    resume.add_argument("--run-id", required=True)
+    resume.add_argument("--concurrency", type=int, default=1, choices=(1, 2, 3))
+    resume.add_argument("--task-pattern")
+    resume.add_argument("--limit", type=int)
+    resume.add_argument("--timeout", type=int, default=900)
+
     regression = sub.add_parser("regression", help="复制只读参考数据集并运行隔离回归")
     regression.add_argument("--source", type=Path, required=True)
     regression.add_argument("--concurrency", type=int, default=1, choices=(1, 2, 3))
@@ -65,18 +73,20 @@ def main(argv: list[str] | None = None) -> int:
         print("Audit is read-only. Advisories do not require revision; blocking findings must be reviewed before any edit.")
         return 1 if failures else 0
 
-    if args.command == "generate":
+    if args.command in {"generate", "resume"}:
         tasks = discover_tasks(args.dataset)
         if args.task_pattern:
             needle = args.task_pattern.casefold()
             tasks = [task for task in tasks if needle in str(task.relative_dir).casefold()]
         if args.limit is not None:
             tasks = tasks[: max(0, args.limit)]
+        is_resume = args.command == "resume"
         run = RubricRun(project, args.dataset, RunOptions(
             concurrency=args.concurrency,
-            force=args.force,
+            force=True if is_resume else args.force,
             timeout_seconds=args.timeout,
-        ))
+            resume=is_resume,
+        ), run_id=args.run_id if is_resume else None)
         outcomes = run.execute(tasks)
         print(json.dumps([outcome.__dict__ for outcome in outcomes], ensure_ascii=False, indent=2))
         return 0 if all(item.status in {"COMPLETED", "AUTO_FINALIZED", "SKIPPED"} for item in outcomes) else 1

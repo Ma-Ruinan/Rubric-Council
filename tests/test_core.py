@@ -25,7 +25,12 @@ from rubric_generator.rubric_spec import (
     normalize_rubric_spec,
     render_rubric,
 )
-from rubric_generator.runner import RubricRun, RunOptions
+from rubric_generator.runner import (
+    RubricRun,
+    RunOptions,
+    apply_json_patch,
+    audit_final_patch_payload,
+)
 
 
 def planned_atom(atom_id: str, metric: str) -> dict[str, object]:
@@ -374,6 +379,23 @@ class RunnerTests(unittest.TestCase):
     def test_default_allows_only_one_reviewer_directed_revision(self):
         self.assertEqual(RunOptions().max_revision_rounds, 1)
 
+    def test_final_patch_is_small_and_applies_locally(self):
+        document = {"metrics": [{"id": "S01", "rule": "old"}], "fixed": 100}
+        payload = {
+            "record_patch": [],
+            "spec_patch": [{
+                "op": "replace", "path": "/metrics/0/rule", "value": "new",
+            }],
+        }
+        self.assertEqual(audit_final_patch_payload(payload), [])
+        patched = apply_json_patch(deepcopy(document), payload["spec_patch"])
+        self.assertEqual(patched["metrics"][0]["rule"], "new")
+        self.assertEqual(patched["fixed"], 100)
+
+    def test_final_patch_rejects_root_replacement(self):
+        with self.assertRaises(ValueError):
+            apply_json_patch({"kept": True}, [{"op": "replace", "path": "", "value": {}}])
+
     def test_offline_full_loop_writes_only_rubric_to_task(self):
         record = sample_record()
         self.assertEqual(audit_authoring_record(record), [])
@@ -484,6 +506,70 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(outcomes[0].status, "COMPLETED")
             artifacts = project / ".rubric-generator" / "runs" / "skip-gate-test" / "tasks"
             self.assertFalse(any(artifacts.rglob("review-01.gate.json")))
+
+    def test_failed_late_stage_resumes_without_repeating_completed_agents(self):
+        record = sample_record()
+        spec = sample_spec()
+        blocked_review = {
+            "verdict": "revision_required", "summary": "仍有分歧",
+            "blocking": [{
+                "id": "R001", "category": "determinism", "location": "T01",
+                "evidence": "规则存在歧义", "reason": "可能改变分数",
+                "required_change": "按裁决锁定",
+            }],
+            "verified": ["其他部分可用"], "suggestions": [],
+        }
+        arbitration = {
+            "summary": "驳回该阻断并保持当前合同",
+            "decisions": [{
+                "issue_id": "R001", "decision": "reject",
+                "basis": "现有规则已经确定", "binding_change": "不修改",
+            }],
+            "final_instructions": ["保持当前 record 与 spec"],
+        }
+        initial_responses = [
+            "BEGIN_AUTHORING_RECORD_JSON\n" + json.dumps(record, ensure_ascii=False) + "\nEND_AUTHORING_RECORD_JSON",
+            "BEGIN_RUBRIC_SPEC_JSON\n" + json.dumps(spec, ensure_ascii=False) + "\nEND_RUBRIC_SPEC_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(blocked_review, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+            "BEGIN_AUTHORING_RECORD_JSON\n" + json.dumps(record, ensure_ascii=False) + "\nEND_AUTHORING_RECORD_JSON",
+            "BEGIN_RUBRIC_SPEC_JSON\n" + json.dumps(spec, ensure_ascii=False) + "\nEND_RUBRIC_SPEC_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(blocked_review, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+            "BEGIN_ARBITRATION_JSON\n" + json.dumps(arbitration, ensure_ascii=False) + "\nEND_ARBITRATION_JSON",
+        ]
+        final_patch = {"record_patch": [], "spec_patch": []}
+        passed_review = {
+            "verdict": "passed", "summary": "裁决已落实", "blocking": [],
+            "verified": ["最终合同可用"], "suggestions": [],
+        }
+        resume_responses = [
+            "BEGIN_FINAL_PATCH_JSON\n" + json.dumps(final_patch) + "\nEND_FINAL_PATCH_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(passed_review, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            dataset = root / "dataset"
+            task_dir = dataset / "维度一" / "题目一"
+            project.mkdir(parents=True)
+            task_dir.mkdir(parents=True)
+            (task_dir / "问题描述.txt").write_text("提交一份结果", encoding="utf-8")
+
+            first = RubricRun(project, dataset, RunOptions(concurrency=1, retries=0), run_id="resume-test")
+            first.client = FakeClient(initial_responses)
+            self.assertEqual(first.execute(discover_tasks(dataset))[0].status, "FAILED")
+
+            resumed = RubricRun(
+                project, dataset,
+                RunOptions(concurrency=1, retries=0, force=True, resume=True),
+                run_id="resume-test",
+            )
+            resumed.client = FakeClient(resume_responses)
+            outcome = resumed.execute(discover_tasks(dataset))[0]
+            self.assertEqual(outcome.status, "AUTO_FINALIZED")
+            self.assertTrue((task_dir / "rubric.md").is_file())
+            task_status = json.loads(next((resumed.run_dir / "tasks").glob("*/status.json")).read_text(encoding="utf-8"))
+            self.assertEqual(task_status["resume_count"], 1)
+            self.assertNotIn("error", task_status)
 
 
 if __name__ == "__main__":

@@ -247,9 +247,9 @@ record 历史：
 """
 
 
-def author_final_record(project_dir: Path, task_dir: Path, material_manifest: Path, current_record: Path, current_spec: Path, arbitration_file: Path, compliance_review: Path | None = None) -> str:
+def author_final_patch(project_dir: Path, task_dir: Path, material_manifest: Path, current_record: Path, current_spec: Path, arbitration_file: Path, compliance_review: Path | None = None) -> str:
     compliance = _path(compliance_review, project_dir) if compliance_review else "无"
-    return f"""根据绑定裁决修订并锁定 authoring record；不要输出规格或 Markdown。
+    return f"""根据绑定裁决对当前 authoring record 与 Rubric Spec 生成最小 JSON Patch；不要重写完整对象，不要输出 Markdown。
 
 题目目录：{_path(task_dir, project_dir)}
 内部素材清单：{_path(material_manifest, project_dir)}
@@ -258,10 +258,20 @@ def author_final_record(project_dir: Path, task_dir: Path, material_manifest: Pa
 裁决：{_path(arbitration_file, project_dir)}
 裁决落实复核：{compliance}
 
-只落实裁决和复核 blocking，不新增变化。{REPORTING_CONTRACT}
-BEGIN_AUTHORING_RECORD_JSON
-{_record_schema()}
-END_AUTHORING_RECORD_JSON
+要求：
+1. 只落实裁决中 decision=modify 的 binding_change，以及复核中的 blocking；不得落实被 reject 的意见。
+2. 使用 RFC 6902 风格操作，op 只允许 add、remove、replace；path 使用标准 JSON Pointer。
+3. value 只放被修改字段或节点的新值，不得把整个 record/spec 塞进补丁。
+4. record_patch 与 spec_patch 都必须是数组；无需修改时输出空数组。
+5. 补丁应用后，record 与 spec 的评分原子语义必须逐字对齐，固定六项输出接口不得改变。
+
+只输出：
+BEGIN_FINAL_PATCH_JSON
+{{
+  "record_patch": [{{"op": "replace", "path": "/JSON/Pointer", "value": "新值"}}],
+  "spec_patch": [{{"op": "replace", "path": "/JSON/Pointer", "value": "新值"}}]
+}}
+END_FINAL_PATCH_JSON
 """
 
 

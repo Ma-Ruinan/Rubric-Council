@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import tempfile
@@ -22,12 +23,13 @@ from .audit import (
     normalize_authoring_record,
 )
 from .config import load_project_env, load_project_settings
-from .dataset import DatasetTask, copy_task_snapshot, discover_tasks
+from .dataset import DatasetTask, copy_task_snapshot, discover_tasks, is_reference_rubric
 from .materials import prepare_material_evidence
 from .opencode_client import OpenCodeClient, OpenCodeError, extract_json
 from .rubric_spec import (
     audit_authoring_record_spec_alignment,
     audit_rubric_spec,
+    audit_rendered_rubric,
     normalize_rubric_spec,
     render_rubric,
     semantic_fingerprint,
@@ -50,6 +52,7 @@ class RunOptions:
     force: bool = False
     timeout_seconds: int = 900
     retries: int = 1
+    resume: bool = False
 
 
 @dataclass
@@ -124,16 +127,38 @@ class RubricRun:
         input_root = task_run / "input"
         artifacts = task_run / "artifacts"
         artifacts.mkdir(parents=True, exist_ok=True)
-        state: dict[str, object] = {
+        status_file = task_run / "status.json"
+        state: dict[str, object] = {}
+        if self.options.resume and status_file.is_file():
+            try:
+                previous_state = json.loads(status_file.read_text(encoding="utf-8"))
+                if isinstance(previous_state, dict):
+                    state.update(previous_state)
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                pass
+        state.update({
             "task_id": task.task_id,
             "relative_dir": str(task.relative_dir),
-            "status": "AUTHORING",
-            "revision_rounds": 0,
-            "started_at": _now(),
-        }
-        self._write_json(task_run / "status.json", state)
+            "status": "RESUMING" if self.options.resume else "AUTHORING",
+        })
+        state.setdefault("revision_rounds", 0)
+        state.setdefault("started_at", _now())
+        if self.options.resume:
+            state["resumed_at"] = _now()
+            state["resume_count"] = int(state.get("resume_count", 0)) + 1
+        self._write_json(status_file, state)
+        revision_rounds = 0
 
         try:
+            existing_snapshot = input_root / task.relative_dir
+            if self.options.resume and existing_snapshot.is_dir():
+                source_fingerprint = _input_fingerprint(task.task_dir, exclude_rubrics=True)
+                snapshot_fingerprint = _input_fingerprint(existing_snapshot, exclude_rubrics=False)
+                if source_fingerprint != snapshot_fingerprint:
+                    raise OSError(
+                        "题目或源素材自上次运行后已变化，不能复用旧检查点；"
+                        "请使用 generate 启动新运行"
+                    )
             snapshot_dir = copy_task_snapshot(task, input_root)
             self._write_json(task_run / "manifest.json", {
                 "task_id": task.task_id,
@@ -144,10 +169,13 @@ class RubricRun:
                     str(path.relative_to(snapshot_dir))
                     for path in snapshot_dir.rglob("*") if path.is_file()
                 ],
+                "input_fingerprint": _input_fingerprint(snapshot_dir, exclude_rubrics=False),
             })
             material_manifest = prepare_material_evidence(snapshot_dir, task_run / "materials")
             scratch_dir = task_run / "scratch"
             scratch_dir.mkdir(parents=True, exist_ok=True)
+            if self.options.resume:
+                self._bootstrap_legacy_checkpoints(artifacts)
 
             state["status"] = "ANALYZING"
             self._write_json(task_run / "status.json", state)
@@ -175,7 +203,6 @@ class RubricRun:
 
             review_files: list[Path] = []
             previous_review: Path | None = None
-            revision_rounds = 0
             passed = False
             final_review: dict[str, object] | None = None
             for review_index in range(1, self.options.max_revision_rounds + 2):
@@ -265,25 +292,21 @@ class RubricRun:
 
                 state["status"] = "FINALIZING"
                 self._write_json(task_run / "status.json", state)
-                authoring_record = self._call_authoring_record(
-                    task.task_id, artifacts, "author-final-record",
-                    prompts.author_final_record(
+                final_patch = self._call_final_patch(
+                    task.task_id, artifacts, "author-final-patch",
+                    prompts.author_final_patch(
                         self.project_dir, snapshot_dir, material_manifest, current_record,
                         current_spec, arbitration_path,
                     ),
-                    f"finalize record {task.task_id}",
+                    f"finalize patch {task.task_id}", snapshot_dir, current_record, current_spec,
                 )
+                authoring_record, rubric_spec = self._apply_final_patch_files(
+                    current_record, current_spec, final_patch,
+                )
+                self._write_json(artifacts / "author-final-patch.json", final_patch)
                 current_record = artifacts / "authoring-record-finalized.json"
                 self._write_json(current_record, authoring_record)
                 record_history.append(current_record)
-                rubric_spec = self._call_rubric_spec(
-                    task.task_id, artifacts, "author-final-spec",
-                    prompts.author_final_spec(
-                        self.project_dir, snapshot_dir, material_manifest, current_record,
-                        current_spec, arbitration_path,
-                    ),
-                    f"finalize spec {task.task_id}", snapshot_dir, authoring_record,
-                )
                 current_spec = artifacts / "rubric-spec-finalized.json"
                 self._write_json(current_spec, rubric_spec)
                 spec_history.append(current_spec)
@@ -331,24 +354,20 @@ class RubricRun:
 
                     state["status"] = "FINAL_CORRECTING"
                     self._write_json(task_run / "status.json", state)
-                    authoring_record = self._call_authoring_record(
-                        task.task_id, artifacts, "author-final-correction-record",
-                        prompts.author_final_record(
+                    final_patch = self._call_final_patch(
+                        task.task_id, artifacts, "author-final-correction-patch",
+                        prompts.author_final_patch(
                             self.project_dir, snapshot_dir, material_manifest, current_record,
                             current_spec, arbitration_path, compliance_review=compliance_path,
                         ),
-                        f"correct final record {task.task_id}",
+                        f"correct final patch {task.task_id}", snapshot_dir, current_record, current_spec,
                     )
+                    authoring_record, rubric_spec = self._apply_final_patch_files(
+                        current_record, current_spec, final_patch,
+                    )
+                    self._write_json(artifacts / "author-final-correction-patch.json", final_patch)
                     current_record = artifacts / "authoring-record-final-corrected.json"
                     self._write_json(current_record, authoring_record)
-                    rubric_spec = self._call_rubric_spec(
-                        task.task_id, artifacts, "author-final-correction-spec",
-                        prompts.author_final_spec(
-                            self.project_dir, snapshot_dir, material_manifest, current_record,
-                            current_spec, arbitration_path, compliance_review=compliance_path,
-                        ),
-                        f"correct final spec {task.task_id}", snapshot_dir, authoring_record,
-                    )
                     current_spec = artifacts / "rubric-spec-final-corrected.json"
                     self._write_json(current_spec, rubric_spec)
                     current_rubric = artifacts / "rubric-final-corrected.md"
@@ -381,6 +400,11 @@ class RubricRun:
             fingerprint = semantic_fingerprint(authoring_record, rubric_spec)
             self._write_json(artifacts / "semantic-fingerprint.json", fingerprint)
             final_status = "AUTO_FINALIZED" if auto_finalized else "COMPLETED"
+            # A resumed task may carry diagnostic fields from its previous
+            # failed attempt.  Once delivery succeeds, status.json must describe
+            # the current terminal state rather than retain a stale failure.
+            state.pop("error", None)
+            state.pop("audit_issues", None)
             state.update({
                 "status": final_status,
                 "completed_at": _now(),
@@ -395,12 +419,15 @@ class RubricRun:
             self._write_json(task_run / "status.json", state)
             self._log(f"[{task.task_id}] 完成：{final_status}；输出 {output}")
             return TaskOutcome(task.task_id, str(task.relative_dir), final_status, str(output), revision_rounds, [])
-        except (OSError, UnicodeError, OpenCodeError, ValueError) as exc:
+        except Exception as exc:
             status = "INPUT_BLOCKED" if isinstance(exc, (OSError, UnicodeError)) else "FAILED"
             state.update({"status": status, "completed_at": _now(), "error": str(exc)})
             self._write_json(task_run / "status.json", state)
             self._log(f"[{task.task_id}] 失败：{status}；{exc}")
-            return TaskOutcome(task.task_id, str(task.relative_dir), status, error=str(exc))
+            return TaskOutcome(
+                task.task_id, str(task.relative_dir), status,
+                revision_rounds=revision_rounds, error=str(exc),
+            )
 
     def _apply_review_classification_gate(
         self,
@@ -442,6 +469,11 @@ class RubricRun:
         return merged
 
     def _call_authoring_record(self, task_id: str, artifacts: Path, phase: str, prompt: str, title: str) -> dict[str, object]:
+        checkpoint = artifacts / f"{phase}.validated.json"
+        cached = self._read_checkpoint(checkpoint, audit_authoring_record)
+        if cached is not None:
+            self._log(f"[{task_id}] {phase} 使用已校验检查点")
+            return cached
         issues: list[str] = []
         for attempt in range(self.options.max_schema_retries + 1):
             suffix = "" if attempt == 0 else f".schema-retry-{attempt:02d}"
@@ -459,6 +491,7 @@ class RubricRun:
                 self._write_json(artifacts / f"{phase + suffix}.normalizations.json", {"changes": changes})
             issues = audit_authoring_record(normalized)
             if not issues:
+                self._write_json(checkpoint, normalized)
                 return normalized
             self._write_json(artifacts / f"{phase}.schema-invalid-{attempt:02d}.json", normalized)
         raise OpenCodeError("Invalid authoring record after bounded correction: " + "; ".join(issues))
@@ -477,9 +510,11 @@ class RubricRun:
 
         def validate(spec: dict[str, object]) -> list[str]:
             normalization_changes.extend(normalize_rubric_spec(spec))
+            rendered_issues, _ = audit_rendered_rubric(render_rubric(spec))
             return [
                 *audit_rubric_spec(spec, task_dir),
                 *audit_authoring_record_spec_alignment(record, spec),
+                *rendered_issues,
             ]
 
         result = self._call_validated_json_agent(
@@ -492,6 +527,37 @@ class RubricRun:
                 {"changes": normalization_changes},
             )
         return result
+
+    def _call_final_patch(
+        self,
+        task_id: str,
+        artifacts: Path,
+        phase: str,
+        prompt: str,
+        title: str,
+        task_dir: Path,
+        record_file: Path,
+        spec_file: Path,
+    ) -> dict[str, object]:
+        def validate(payload: dict[str, object]) -> list[str]:
+            issues = audit_final_patch_payload(payload)
+            if issues:
+                return issues
+            try:
+                record, spec = self._apply_final_patch_files(record_file, spec_file, payload)
+            except (KeyError, IndexError, TypeError, ValueError) as exc:
+                return [f"patch application failed: {exc}"]
+            return [
+                *audit_authoring_record(record),
+                *audit_rubric_spec(spec, task_dir),
+                *audit_authoring_record_spec_alignment(record, spec),
+                *audit_rendered_rubric(render_rubric(spec))[0],
+            ]
+
+        return self._call_validated_json_agent(
+            task_id, artifacts, phase, "rubric-author", prompt, title,
+            "BEGIN_FINAL_PATCH_JSON", "END_FINAL_PATCH_JSON", validate, "final patch",
+        )
 
     def _call_validated_json_agent(
         self,
@@ -506,6 +572,11 @@ class RubricRun:
         validator: Callable[[dict[str, object]], list[str]],
         payload_name: str,
     ) -> dict[str, object]:
+        checkpoint = artifacts / f"{phase}.validated.json"
+        cached = self._read_checkpoint(checkpoint, validator)
+        if cached is not None:
+            self._log(f"[{task_id}] {phase} 使用已校验检查点")
+            return cached
         issues: list[str] = []
         for attempt in range(self.options.max_schema_retries + 1):
             suffix = "" if attempt == 0 else f".schema-retry-{attempt:02d}"
@@ -520,9 +591,70 @@ class RubricRun:
             )
             issues = validator(payload)
             if not issues:
+                self._write_json(checkpoint, payload)
                 return payload
             self._write_json(artifacts / f"{phase}.schema-invalid-{attempt:02d}.json", payload)
         raise OpenCodeError(f"Invalid {payload_name} after bounded correction: " + "; ".join(issues))
+
+    def _read_checkpoint(
+        self,
+        path: Path,
+        validator: Callable[[dict[str, object]], list[str]],
+    ) -> dict[str, object] | None:
+        if not path.is_file():
+            return None
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or validator(payload):
+            return None
+        return payload
+
+    def _bootstrap_legacy_checkpoints(self, artifacts: Path) -> None:
+        """Make artifacts from pre-checkpoint runs resumable without model calls."""
+        mappings: list[tuple[str, str]] = [
+            ("author-analysis", "authoring-record-00.json"),
+            ("author-spec-00", "rubric-spec-00.json"),
+            ("arbitration", "arbitration.json"),
+        ]
+        for record in artifacts.glob("authoring-record-[0-9][0-9].json"):
+            if record.name != "authoring-record-00.json":
+                index = record.stem.rsplit("-", 1)[-1]
+                mappings.append((f"author-revision-record-{index}", record.name))
+        for spec in artifacts.glob("rubric-spec-[0-9][0-9].json"):
+            if spec.name != "rubric-spec-00.json":
+                index = spec.stem.rsplit("-", 1)[-1]
+                mappings.append((f"author-spec-{index}", spec.name))
+        for raw_review in artifacts.glob("review-[0-9][0-9].raw.json"):
+            phase = raw_review.name.removesuffix(".raw.json")
+            mappings.append((phase, raw_review.name))
+            gate = artifacts / f"{phase}.gate.json"
+            if gate.is_file():
+                mappings.append((f"{phase}-gate", gate.name))
+        for phase, source_name in mappings:
+            source = artifacts / source_name
+            target = artifacts / f"{phase}.validated.json"
+            if source.is_file() and not target.exists():
+                try:
+                    payload = json.loads(source.read_text(encoding="utf-8"))
+                except (OSError, UnicodeError, json.JSONDecodeError):
+                    continue
+                if isinstance(payload, dict):
+                    self._write_json(target, payload)
+
+    @staticmethod
+    def _apply_final_patch_files(
+        record_file: Path,
+        spec_file: Path,
+        payload: dict[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        record = json.loads(record_file.read_text(encoding="utf-8"))
+        spec = json.loads(spec_file.read_text(encoding="utf-8"))
+        return (
+            apply_json_patch(record, payload.get("record_patch", [])),
+            apply_json_patch(spec, payload.get("spec_patch", [])),
+        )
 
     def _call_json_agent(
         self,
@@ -536,6 +668,18 @@ class RubricRun:
         end: str,
     ) -> dict[str, object]:
         last_error: OpenCodeError | None = None
+        if self.options.resume:
+            for attempt in range(self.options.max_format_retries + 1):
+                suffix = "" if attempt == 0 else f".format-retry-{attempt:02d}"
+                response_file = artifacts / f"{phase + suffix}.response.txt"
+                if not response_file.is_file():
+                    continue
+                try:
+                    cached = extract_json(response_file.read_text(encoding="utf-8"), begin, end)
+                except (OSError, UnicodeError, OpenCodeError):
+                    continue
+                self._log(f"[{task_id}] {phase + suffix} 复用已完整返回的模型响应")
+                return cached
         for attempt in range(self.options.max_format_retries + 1):
             suffix = "" if attempt == 0 else f".format-retry-{attempt:02d}"
             attempt_prompt = prompt
@@ -590,12 +734,23 @@ class RubricRun:
 
     def _write_summary(self, outcomes: list[TaskOutcome]) -> None:
         with self._write_lock:
+            merged = {item.task_id: item for item in outcomes}
+            summary_path = self.run_dir / "summary.json"
+            if self.options.resume and summary_path.is_file():
+                try:
+                    previous = json.loads(summary_path.read_text(encoding="utf-8"))
+                    for item in previous.get("tasks", []):
+                        if isinstance(item, dict) and isinstance(item.get("task_id"), str):
+                            merged.setdefault(item["task_id"], TaskOutcome(**item))
+                except (OSError, UnicodeError, json.JSONDecodeError, TypeError):
+                    pass
+            all_outcomes = sorted(merged.values(), key=lambda x: x.relative_dir.casefold())
             self._write_json(self.run_dir / "summary.json", {
                 "run_id": self.run_id,
                 "dataset": str(self.dataset_root),
                 "options": asdict(self.options),
                 "updated_at": _now(),
-                "tasks": [asdict(item) for item in sorted(outcomes, key=lambda x: x.relative_dir.casefold())],
+                "tasks": [asdict(item) for item in all_outcomes],
             })
 
     def _log(self, message: str) -> None:
@@ -624,6 +779,98 @@ class RubricRun:
             except OSError:
                 pass
             raise
+
+
+def audit_final_patch_payload(payload: dict[str, object]) -> list[str]:
+    issues: list[str] = []
+    for key in ("record_patch", "spec_patch"):
+        operations = payload.get(key)
+        if not isinstance(operations, list):
+            issues.append(f"{key} must be a list")
+            continue
+        if len(operations) > 30:
+            issues.append(f"{key} contains too many operations; finalization must be minimal")
+        for index, operation in enumerate(operations):
+            if not isinstance(operation, dict):
+                issues.append(f"{key}[{index}] must be an object")
+                continue
+            op = operation.get("op")
+            path = operation.get("path")
+            if op not in {"add", "remove", "replace"}:
+                issues.append(f"{key}[{index}].op is unsupported")
+            if not isinstance(path, str) or not path.startswith("/"):
+                issues.append(f"{key}[{index}].path must be a JSON Pointer")
+            if op in {"add", "replace"} and "value" not in operation:
+                issues.append(f"{key}[{index}] requires value")
+    return issues
+
+
+def apply_json_patch(document: object, operations: object) -> dict[str, object]:
+    if not isinstance(document, dict) or not isinstance(operations, list):
+        raise TypeError("patch document must be an object and operations must be a list")
+    for operation in operations:
+        if not isinstance(operation, dict):
+            raise TypeError("patch operation must be an object")
+        op = operation.get("op")
+        pointer = operation.get("path")
+        if op not in {"add", "remove", "replace"} or not isinstance(pointer, str):
+            raise ValueError("invalid patch operation")
+        tokens = [_decode_pointer_token(token) for token in pointer.split("/")[1:]]
+        if not tokens:
+            raise ValueError("root replacement is not allowed")
+        parent: object = document
+        for token in tokens[:-1]:
+            if isinstance(parent, dict):
+                if token not in parent:
+                    raise KeyError(pointer)
+                parent = parent[token]
+            elif isinstance(parent, list):
+                parent = parent[int(token)]
+            else:
+                raise TypeError(f"non-container in JSON Pointer: {pointer}")
+        leaf = tokens[-1]
+        if isinstance(parent, dict):
+            if op in {"remove", "replace"} and leaf not in parent:
+                raise KeyError(pointer)
+            if op == "remove":
+                del parent[leaf]
+            else:
+                parent[leaf] = operation.get("value")
+        elif isinstance(parent, list):
+            if op == "add" and leaf == "-":
+                parent.append(operation.get("value"))
+                continue
+            index = int(leaf)
+            if op == "add":
+                if index < 0 or index > len(parent):
+                    raise IndexError(pointer)
+                parent.insert(index, operation.get("value"))
+            elif op == "remove":
+                del parent[index]
+            else:
+                parent[index] = operation.get("value")
+        else:
+            raise TypeError(f"non-container at JSON Pointer leaf: {pointer}")
+    return document
+
+
+def _decode_pointer_token(token: str) -> str:
+    return token.replace("~1", "/").replace("~0", "~")
+
+
+def _input_fingerprint(root: Path, exclude_rubrics: bool) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.as_posix().casefold()):
+        if not path.is_file() or (exclude_rubrics and is_reference_rubric(path)):
+            continue
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf-8"))
+        digest.update(b"\0")
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                digest.update(chunk)
+        digest.update(b"\0")
+    return digest.hexdigest()
 
 
 def _now() -> str:
