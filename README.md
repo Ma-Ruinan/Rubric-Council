@@ -38,7 +38,13 @@ cd /d/mywork/rubric-generator-v1.0
 uv sync
 ```
 
-项目内置的 `opencode.jsonc` 使用 AI·AAA 的 OpenAI 兼容端点。生成器会优先保留进程环境变量，并在变量不存在时自动读取项目根目录中被 Git 忽略的 `.env`：
+仓库提供 `opencode.example.jsonc`，其中配置了 AI·AAA 的 OpenAI 兼容端点。首次使用时复制为被 Git 忽略的本机配置：
+
+```bash
+cp opencode.example.jsonc opencode.jsonc
+```
+
+生成器会优先保留进程环境变量，并在变量不存在时自动读取项目根目录中被 Git 忽略的 `.env`：
 
 ```bash
 AIAAA_API_KEY=sk-你的密钥
