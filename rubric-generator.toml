@@ -3,6 +3,15 @@
 [agents.rubric-author]
 model = "aiaaa/deepseek-v4.1-flash#high"
 
+[agents.rubric-finalizer]
+model = "aiaaa/deepseek-v4.1-flash#high"
+
+[agents.rubric-json-repair]
+model = "aiaaa/deepseek-v4.1-flash#high"
+
+[agents.rubric-runtime-probe]
+model = "aiaaa/deepseek-v4.1-flash#high"
+
 [agents.rubric-reviewer]
 model = "aiaaa/deepseek-v4.1-flash#high"
 

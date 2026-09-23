@@ -2,6 +2,10 @@
 
 面向 AI Agent 测评数据集的题目级 Rubric 生成器。输入目录中的每道题由 `问题描述.txt` 和可选源素材组成；成功后仅把 `rubric.md` 写回题目目录，完整制作、审核、修订和裁决留痕保存在项目的 `.rubric-generator/runs/`。
 
+## Pipeline
+
+![Rubric Council Pipeline](./Rubric_Council_pipeline.png)
+
 ## 输出接口
 
 每道题的 Rubric 固定输出：
@@ -22,7 +26,7 @@
 3. 程序检查 ID、六组权重、状态函数、真实输入路径及 record/spec 对齐，然后确定性渲染候选 `rubric.md`。
 4. Reviewer 独立核查题意、锚点、可计算性、开放答案公平性和自包含性。
 5. Reviewer 已判定通过但仍有 suggestions 时，独立 Classification Gate 才复核其严重性；只有存在具体、可复现评分后果的项目才提升为 blocking。
-6. 最多一轮定向修改；仍有阻断分歧时由 Arbitrator 作一次绑定裁决。裁决后只生成并应用最小 JSON Patch，不重新输出整份大型 record/spec。
+6. 最多一轮 Reviewer 定向修改；仍有阻断分歧时由 Arbitrator 作一次绑定裁决。裁决后只生成并应用最小 JSON Patch，不重新输出整份大型 record/spec；最终合规阶段最多允许两次窄范围修正，且每次均按候选内容隔离检查点。
 7. 每个通过机器校验的阶段立即保存为检查点；通过最终静态检查后原子写入题目目录，中间文件留在项目运行目录。
 
 Reviewer 只报告会造成错误评分或无法可靠执行的问题。措辞、排版偏好和“为了更完整”的新增要求不能成为阻断项。
@@ -34,7 +38,7 @@ Reviewer 只报告会造成错误评分或无法可靠执行的问题。措辞�
 需要 Python 3.11+、[uv](https://docs.astral.sh/uv/) 和 OpenCode。进入项目目录后运行：
 
 ```bash
-cd /d/mywork/rubric-generator-v1.0
+cd Rubric-Council
 uv sync
 ```
 
@@ -56,7 +60,11 @@ AIAAA_API_KEY=sk-你的密钥
 export AIAAA_API_KEY="sk-你的密钥"
 ```
 
-五个 Agent 默认均使用 `aiaaa/deepseek-v4.1-flash#high`。每个角色可在 `rubric-generator.toml` 中分别修改模型。Agent frontmatter 的温度均为 `0.1`。
+八个 Agent（含轻量运行时兼容性检查和 JSON 语法修复角色）默认均使用 `aiaaa/deepseek-v4.1-flash#high`。最终补丁 Agent 只接收已校验产物与绑定裁决；制作、修订和审核阶段由程序直接传入已掌握的本地输入，避免模型重复加载 Skill或读取同一文件。每个角色可在 `rubric-generator.toml` 中分别修改模型。Agent frontmatter 的温度均为 `0.1`。
+
+每次生成或续跑开始前，程序会执行一次很小的工具续写检查。如果中转站不能在工具返回后继续生成，程序会在启动题目之前安全停止，不会把整批任务逐题跑成失败。模型调用中的不完整 HTTP 错误只进行有限重试；已经输出完整标记结果的调用仍会进入正常校验。
+
+如果长时间调用已经输出完整 BEGIN/END 标记，但上游流中断在 JSON 内留下局部截断或重复残片，程序会优先调用无工具的 JSON 修复角色，只修语法并复用既有研究结果，不会从头执行整道题。
 
 ## 运行
 
@@ -76,6 +84,16 @@ uv run rubric-generator generate \
   --task-pattern "维度一" \
   --limit 2 \
   --concurrency 2
+```
+
+只生成当前尚无 `rubric.md` 的题目（续跑时会保留相同 run ID 下的有效检查点）：
+
+```bash
+uv run rubric-generator resume \
+  --dataset "D:/path/to/测试数据集" \
+  --run-id "已有运行ID" \
+  --missing-only \
+  --concurrency 3
 ```
 
 默认跳过已有 `rubric.md`。确认需要重做时加 `--force`；原版本会备份到当次运行留痕中。

@@ -336,7 +336,8 @@ def audit_authoring_record(record: dict[str, Any]) -> list[str]:
                             f"planned atom {atom_id or index} references unknown requirements or anchors: "
                             + ", ".join(unknown)
                         )
-                if atom.get("state_function") == "CLAIM-RATIO":
+                state_function = atom.get("state_function")
+                if state_function == "CLAIM-RATIO":
                     empty_value = atom.get("empty_set_value")
                     valid_empty_value = (
                         isinstance(empty_value, int)
@@ -350,9 +351,25 @@ def audit_authoring_record(record: dict[str, Any]) -> list[str]:
                     reason = atom.get("empty_set_reason")
                     if not isinstance(reason, str) or not reason.strip():
                         issues.append(f"planned atom {atom_id or index} CLAIM-RATIO requires empty_set_reason")
+                elif state_function == "RATIO":
+                    empty_value = atom.get("empty_set_value")
+                    reason = atom.get("empty_set_reason")
+                    has_value = empty_value is not None
+                    has_reason = isinstance(reason, str) and bool(reason.strip())
+                    if has_value or has_reason:
+                        valid_empty_value = (
+                            isinstance(empty_value, int)
+                            and not isinstance(empty_value, bool)
+                            and empty_value in (0, 1)
+                        )
+                        if not valid_empty_value or not has_reason:
+                            issues.append(
+                                f"planned atom {atom_id or index} RATIO empty-set policy requires "
+                                "empty_set_value 0 or 1 and non-empty empty_set_reason"
+                            )
                 elif atom.get("empty_set_value") is not None or atom.get("empty_set_reason") not in {"", None}:
                     issues.append(
-                        f"planned atom {atom_id or index} non-CLAIM-RATIO atom must not define an empty-set policy"
+                        f"planned atom {atom_id or index} {state_function} atom must not define an empty-set policy"
                     )
             if abs(total - 100.0) > 1e-6:
                 issues.append(f"planned {group_name} atom weights must sum to 100, got {total:g}")

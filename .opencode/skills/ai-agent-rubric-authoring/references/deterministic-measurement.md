@@ -5,7 +5,7 @@
 Choose only the functions needed by the task.
 
 - `BIN`: one indivisible observable condition; state is 0 or 1.
-- `RATIO`: satisfied explicitly numbered conditions divided by applicable conditions.
+- `RATIO`: satisfied explicitly numbered conditions divided by applicable conditions. If the applicable-condition denominator can be zero, define the resulting state as `empty_set_value` (`0` or `1`) with a non-empty `empty_set_reason`; if the denominator is provably fixed and nonzero, no empty-set policy is needed.
 - `COUNT`: `min(valid item count / justified target, 1)`; define a valid item and cite the target's source.
 - `CLAIM-RATIO`: supported/correct audited claims divided by applicable audited claims; define claim segmentation and the complete audit universe or a justified deterministic sample. Store the no-applicable-claim result separately as `empty_set_value` (`0` or `1`) plus a non-empty `empty_set_reason`; do not infer it from prose keywords.
 

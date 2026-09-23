@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import hashlib
 import os
+import re
 import shutil
 import tempfile
 import threading
@@ -46,7 +47,10 @@ FINAL_STATES = {
 class RunOptions:
     concurrency: int = 3
     max_revision_rounds: int = 1
-    max_final_compliance_repairs: int = 1
+    # Keep the main reviewer-directed rewrite at one round, but allow a second
+    # narrowly scoped final correction when the first correction itself leaves
+    # a score-changing ambiguity.  The loop remains strictly bounded.
+    max_final_compliance_repairs: int = 2
     max_format_retries: int = 1
     max_schema_retries: int = 1
     force: bool = False
@@ -95,6 +99,17 @@ class RubricRun:
         selected = tasks if tasks is not None else discover_tasks(self.dataset_root)
         if not selected:
             raise RuntimeError(f"未找到问题描述.txt: {self.dataset_root}")
+        tool_probe = getattr(self.client, "check_tool_roundtrip", None)
+        if callable(tool_probe):
+            self._log("正在执行模型工具续写兼容性检查；未通过时不会启动题目任务")
+            try:
+                tool_probe()
+            except OpenCodeError as exc:
+                raise RuntimeError(
+                    "模型网关未通过工具续写兼容性检查，已停止本次运行；"
+                    "题目检查点和数据集均未改变。请稍后重试或更换支持工具调用的模型接口。"
+                ) from exc
+            self._log("模型工具续写兼容性检查通过")
         total = len(selected)
         self._log(
             f"运行 {self.run_id} 开始：共 {total} 道题，并发数 {self.options.concurrency}；"
@@ -299,6 +314,7 @@ class RubricRun:
                         current_spec, arbitration_path,
                     ),
                     f"finalize patch {task.task_id}", snapshot_dir, current_record, current_spec,
+                    require_change=_arbitration_requires_change(arbitration),
                 )
                 authoring_record, rubric_spec = self._apply_final_patch_files(
                     current_record, current_spec, final_patch,
@@ -318,8 +334,15 @@ class RubricRun:
                 for compliance_index in range(self.options.max_final_compliance_repairs + 1):
                     state["status"] = "FINAL_REVIEWING"
                     self._write_json(task_run / "status.json", state)
+                    final_review_phase = f"final-review-{compliance_index + 1:02d}"
+                    if compliance_index:
+                        # A later compliance review must be bound to the corrected
+                        # candidate.  Otherwise resume could reuse a valid JSON
+                        # checkpoint that reviewed an older rubric version.
+                        candidate_hash = semantic_fingerprint(authoring_record, rubric_spec)["sha256"][:12]
+                        final_review_phase = f"{final_review_phase}-{candidate_hash}"
                     raw_compliance_data = self._call_validated_json_agent(
-                        task.task_id, artifacts, f"final-review-{compliance_index + 1:02d}",
+                        task.task_id, artifacts, final_review_phase,
                         "rubric-reviewer",
                         prompts.review(
                             self.project_dir, snapshot_dir, material_manifest, current_record,
@@ -330,18 +353,18 @@ class RubricRun:
                         "BEGIN_REVIEW_JSON", "END_REVIEW_JSON",
                         audit_review_payload, "final reviewer output",
                     )
-                    raw_compliance_path = artifacts / f"final-review-{compliance_index + 1:02d}.raw.json"
+                    raw_compliance_path = artifacts / f"{final_review_phase}.raw.json"
                     self._write_json(raw_compliance_path, raw_compliance_data)
                     raw_blocking = raw_compliance_data.get("blocking")
                     if raw_compliance_data.get("verdict") == "passed" and not raw_blocking:
                         compliance_data = self._apply_review_classification_gate(
-                            task.task_id, artifacts, f"final-review-{compliance_index + 1:02d}",
+                            task.task_id, artifacts, final_review_phase,
                             raw_compliance_data, snapshot_dir, current_record, current_spec,
                             current_rubric, raw_compliance_path,
                         )
                     else:
                         compliance_data = raw_compliance_data
-                    compliance_path = artifacts / f"final-review-{compliance_index + 1:02d}.json"
+                    compliance_path = artifacts / f"{final_review_phase}.json"
                     self._write_json(compliance_path, compliance_data)
                     final_review = compliance_data
                     blocking = compliance_data.get("blocking")
@@ -354,17 +377,25 @@ class RubricRun:
 
                     state["status"] = "FINAL_CORRECTING"
                     self._write_json(task_run / "status.json", state)
+                    correction_phase = "author-final-correction-patch"
+                    if compliance_index:
+                        candidate_hash = semantic_fingerprint(authoring_record, rubric_spec)["sha256"][:12]
+                        correction_phase = (
+                            f"author-final-correction-patch-{compliance_index + 1:02d}-{candidate_hash}"
+                        )
                     final_patch = self._call_final_patch(
-                        task.task_id, artifacts, "author-final-correction-patch",
+                        task.task_id, artifacts, correction_phase,
                         prompts.author_final_patch(
                             self.project_dir, snapshot_dir, material_manifest, current_record,
                             current_spec, arbitration_path, compliance_review=compliance_path,
                         ),
                         f"correct final patch {task.task_id}", snapshot_dir, current_record, current_spec,
+                        require_change=True,
                     )
                     authoring_record, rubric_spec = self._apply_final_patch_files(
                         current_record, current_spec, final_patch,
                     )
+                    self._write_json(artifacts / f"{correction_phase}.json", final_patch)
                     self._write_json(artifacts / "author-final-correction-patch.json", final_patch)
                     current_record = artifacts / "authoring-record-final-corrected.json"
                     self._write_json(current_record, authoring_record)
@@ -538,11 +569,15 @@ class RubricRun:
         task_dir: Path,
         record_file: Path,
         spec_file: Path,
+        *,
+        require_change: bool = False,
     ) -> dict[str, object]:
         def validate(payload: dict[str, object]) -> list[str]:
             issues = audit_final_patch_payload(payload)
             if issues:
                 return issues
+            if require_change and not payload.get("record_patch") and not payload.get("spec_patch"):
+                return ["binding arbitration or blocking compliance review requires a non-empty patch"]
             try:
                 record, spec = self._apply_final_patch_files(record_file, spec_file, payload)
             except (KeyError, IndexError, TypeError, ValueError) as exc:
@@ -555,7 +590,7 @@ class RubricRun:
             ]
 
         return self._call_validated_json_agent(
-            task_id, artifacts, phase, "rubric-author", prompt, title,
+            task_id, artifacts, phase, "rubric-finalizer", prompt, title,
             "BEGIN_FINAL_PATCH_JSON", "END_FINAL_PATCH_JSON", validate, "final patch",
         )
 
@@ -583,7 +618,10 @@ class RubricRun:
             attempt_prompt = prompt
             if attempt:
                 invalid = artifacts / f"{phase}.schema-invalid-{attempt - 1:02d}.json"
-                attempt_prompt += self._schema_correction_instruction(invalid, issues, payload_name)
+                attempt_prompt += self._schema_correction_instruction(
+                    invalid, issues, payload_name,
+                    inline_invalid=agent == "rubric-finalizer",
+                )
                 self._log(f"[{task_id}] {phase} 结构校验未通过，进行第 {attempt} 次纠错")
             payload = self._call_json_agent(
                 task_id, artifacts, phase + suffix, agent, attempt_prompt, title + suffix,
@@ -675,9 +713,22 @@ class RubricRun:
                 if not response_file.is_file():
                     continue
                 try:
-                    cached = extract_json(response_file.read_text(encoding="utf-8"), begin, end)
-                except (OSError, UnicodeError, OpenCodeError):
+                    cached_text = response_file.read_text(encoding="utf-8")
+                except (OSError, UnicodeError):
                     continue
+                try:
+                    cached = extract_json(cached_text, begin, end)
+                except OpenCodeError:
+                    if begin not in cached_text or end not in cached_text:
+                        continue
+                    try:
+                        cached = self._repair_complete_json_response(
+                            task_id, artifacts, phase + suffix, cached_text, begin, end,
+                        )
+                    except OpenCodeError as exc:
+                        self._log(f"[{task_id}] {phase + suffix} 已有完整标记响应，但 JSON 修复失败：{exc}")
+                        continue
+                    self._log(f"[{task_id}] {phase + suffix} 已从完整标记响应修复局部 JSON 损坏")
                 self._log(f"[{task_id}] {phase + suffix} 复用已完整返回的模型响应")
                 return cached
         for attempt in range(self.options.max_format_retries + 1):
@@ -696,17 +747,139 @@ class RubricRun:
             try:
                 return extract_json(response.text, begin, end)
             except OpenCodeError as exc:
-                last_error = exc
+                if begin in response.text and end in response.text:
+                    try:
+                        return self._repair_complete_json_response(
+                            task_id, artifacts, stem, response.text, begin, end,
+                        )
+                    except OpenCodeError as repair_exc:
+                        last_error = repair_exc
+                if response.terminal_error:
+                    if last_error is None:
+                        last_error = OpenCodeError(
+                            f"{phase} provider failed before complete JSON: {response.terminal_error}"
+                        )
+                    break
+                if last_error is None:
+                    last_error = exc
         raise last_error or OpenCodeError(f"{phase} returned invalid JSON")
 
-    def _schema_correction_instruction(self, invalid_path: Path, issues: list[str], payload_name: str) -> str:
+    def _repair_complete_json_response(
+        self,
+        task_id: str,
+        artifacts: Path,
+        stem: str,
+        damaged_text: str,
+        begin: str,
+        end: str,
+    ) -> dict[str, object]:
+        start = damaged_text.find(begin)
+        stop = damaged_text.rfind(end)
+        if start < 0 or stop < start:
+            raise OpenCodeError("JSON repair requires a complete marker pair")
+        marked = damaged_text[start: stop + len(end)]
+        local_repair = self._try_local_stream_overlap_repair(marked, begin, end)
+        if local_repair is not None:
+            payload, repair_note = local_repair
+            self._write_json(artifacts / f"{stem}.json-repair.local.json", repair_note)
+            self._log(f"[{task_id}] {stem} 已确定性移除流恢复产生的重复截断行")
+            return payload
+        prompt = (
+            "修复下列完整标记响应中的最小 JSON 语法损坏。"
+            "不得重新研究、改写、补充或删减任何完整内容；保持原标记。\n\n"
+            + marked
+        )
+        repair_stem = stem + ".json-repair"
+        self._log(f"[{task_id}] {stem} 标记完整但 JSON 受损，正在执行局部语法修复")
+        response = self.client.run_agent(
+            "rubric-json-repair", prompt, f"repair JSON {task_id} {stem}",
+        )
+        self._write_text(artifacts / f"{repair_stem}.events.jsonl", response.raw_output)
+        self._write_text(artifacts / f"{repair_stem}.response.txt", response.text + "\n")
+        try:
+            return extract_json(response.text, begin, end)
+        except OpenCodeError as exc:
+            if response.terminal_error:
+                raise OpenCodeError(
+                    f"{repair_stem} provider failed before valid repaired JSON: "
+                    f"{response.terminal_error}"
+                ) from exc
+            raise OpenCodeError(f"{repair_stem} returned invalid repaired JSON: {exc}") from exc
+
+    @staticmethod
+    def _try_local_stream_overlap_repair(
+        marked_text: str,
+        begin: str,
+        end: str,
+    ) -> tuple[dict[str, object], dict[str, object]] | None:
+        start = marked_text.find(begin) + len(begin)
+        stop = marked_text.rfind(end)
+        body = marked_text[start:stop].strip()
+        try:
+            json.loads(body)
+            return None
+        except json.JSONDecodeError as exc:
+            error_index = exc.lineno - 1
+        lines = body.splitlines()
+        key_pattern = re.compile(r'^\s*"([^"\\]+)"\s*:')
+        for index in (error_index, error_index - 1):
+            if index < 0 or index + 1 >= len(lines):
+                continue
+            broken_match = key_pattern.match(lines[index])
+            resumed_match = key_pattern.match(lines[index + 1])
+            if not broken_match or not resumed_match:
+                continue
+            if broken_match.group(1) != resumed_match.group(1):
+                continue
+            # A streaming seam commonly leaves an unterminated first copy of
+            # a field and then resumes by emitting that field again in full.
+            # Only remove the first line when its quote count is odd and the
+            # resulting entire document parses; otherwise defer to the
+            # bounded, semantics-preserving repair agent.
+            if lines[index].count('"') % 2 == 0:
+                continue
+            candidate_lines = lines[:index] + lines[index + 1:]
+            candidate_text = "\n".join(candidate_lines)
+            try:
+                payload = json.loads(candidate_text)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(payload, dict):
+                continue
+            return payload, {
+                "repair": "removed_truncated_duplicate_field_line",
+                "json_line": index + 1,
+                "field": broken_match.group(1),
+                "removed_sha256": hashlib.sha256(lines[index].encode("utf-8")).hexdigest(),
+            }
+        return None
+
+    def _schema_correction_instruction(
+        self,
+        invalid_path: Path,
+        issues: list[str],
+        payload_name: str,
+        *,
+        inline_invalid: bool = False,
+    ) -> str:
         relative = invalid_path.resolve().relative_to(self.project_dir).as_posix()
+        if inline_invalid:
+            try:
+                invalid_value = json.loads(invalid_path.read_text(encoding="utf-8"))
+                invalid_input = (
+                    "无效版本如下（不得读取路径）：\n"
+                    + json.dumps(invalid_value, ensure_ascii=False, separators=(",", ":"))
+                )
+            except (OSError, UnicodeError, json.JSONDecodeError):
+                invalid_input = "无效版本不可读；请仅依据原始输入和下列校验错误重新输出。"
+        else:
+            invalid_input = f"无效的 {payload_name} 已保存于：{relative}\n读取无效版本后修正。"
         return (
             "\n\n上一次输出可以解析，但未通过机器结构校验。"
-            f"无效的 {payload_name} 已保存于：{relative}\n"
+            f"{invalid_input}\n"
             "只修复下列错误，不重新设计已经正确的事实、判断或评分契约：\n"
             + json.dumps(issues, ensure_ascii=False, indent=2)
-            + "\n读取无效版本并输出修正后的完整对象，继续使用原提示要求的标记。"
+            + "\n输出修正后的完整对象，继续使用原提示要求的标记。"
         )
 
     def _commit_rubric(self, task: DatasetTask, candidate: Path) -> Path:
@@ -803,6 +976,17 @@ def audit_final_patch_payload(payload: dict[str, object]) -> list[str]:
             if op in {"add", "replace"} and "value" not in operation:
                 issues.append(f"{key}[{index}] requires value")
     return issues
+
+
+def _arbitration_requires_change(arbitration: dict[str, object]) -> bool:
+    """Return whether the binding arbitration actually orders a modification."""
+    decisions = arbitration.get("decisions")
+    if not isinstance(decisions, list):
+        return False
+    return any(
+        isinstance(item, dict) and item.get("decision") in {"accept", "modify"}
+        for item in decisions
+    )
 
 
 def apply_json_patch(document: object, operations: object) -> dict[str, object]:

@@ -11,6 +11,9 @@ permission:
   task:
     "*": deny
     "rubric-author": allow
+    "rubric-finalizer": allow
+    "rubric-json-repair": allow
+    "rubric-runtime-probe": allow
     "rubric-reviewer": allow
     "rubric-review-classifier": allow
     "rubric-arbitrator": allow

@@ -61,7 +61,7 @@ For every numeric threshold not stated in the prompt, record its basis. Prefer n
 
 Lock the planned atom contract in the authoring record before prose finalization: atom ID, evaluation layer, primary purpose, weight, state function, formula/state rule, and linked requirement or anchor IDs. Later wording may improve, but this contract may change only when source-backed analysis or review proves it wrong.
 
-Before locking, confirm every mandatory requirement is directly tested by at least one scored state rule. Merely attaching a requirement ID is not sufficient. Define empty-set behavior for every `CLAIM-RATIO`, prefer natural denominators to invented thresholds, and reserve severe caps for material conclusion-changing failures.
+Before locking, confirm every mandatory requirement is directly tested by at least one scored state rule. Merely attaching a requirement ID is not sufficient. Define empty-set behavior for every `CLAIM-RATIO` and for any `RATIO` whose denominator can be zero, prefer natural denominators to invented thresholds, and reserve severe caps for material conclusion-changing failures.
 
 ## 7. Build and validate the Rubric Spec
 

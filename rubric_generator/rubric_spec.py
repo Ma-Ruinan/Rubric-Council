@@ -686,7 +686,8 @@ def _audit_atom_group(
                     f"{atom_id or metric} references unknown requirements or anchors: "
                     + ", ".join(unknown)
                 )
-        if atom.get("state_function") == "CLAIM-RATIO":
+        state_function = atom.get("state_function")
+        if state_function == "CLAIM-RATIO":
             empty_value = atom.get("empty_set_value")
             valid_empty_value = (
                 isinstance(empty_value, int)
@@ -697,8 +698,24 @@ def _audit_atom_group(
                 issues.append(f"{atom_id or metric} CLAIM-RATIO empty_set_value must be 0 or 1")
             if not isinstance(atom.get("empty_set_reason"), str) or not atom.get("empty_set_reason", "").strip():
                 issues.append(f"{atom_id or metric} CLAIM-RATIO requires empty_set_reason")
+        elif state_function == "RATIO":
+            empty_value = atom.get("empty_set_value")
+            reason = atom.get("empty_set_reason")
+            has_value = empty_value is not None
+            has_reason = isinstance(reason, str) and bool(reason.strip())
+            if has_value or has_reason:
+                valid_empty_value = (
+                    isinstance(empty_value, int)
+                    and not isinstance(empty_value, bool)
+                    and empty_value in (0, 1)
+                )
+                if not valid_empty_value or not has_reason:
+                    issues.append(
+                        f"{atom_id or metric} RATIO empty-set policy requires "
+                        "empty_set_value 0 or 1 and non-empty empty_set_reason"
+                    )
         elif atom.get("empty_set_value") is not None or atom.get("empty_set_reason") not in {"", None}:
-            issues.append(f"{atom_id or metric} non-CLAIM-RATIO atom must not define an empty-set policy")
+            issues.append(f"{atom_id or metric} {state_function} atom must not define an empty-set policy")
         try:
             weight = float(atom.get("weight"))
             if weight <= 0:
@@ -752,7 +769,7 @@ def _render_atom_table(atoms: list[dict[str, Any]]) -> list[str]:
     for atom in atoms:
         trace = "、".join(str(value) for value in atom.get("requirement_or_anchor_ids", [])) or "—"
         rule = f"**{atom['state_function']}**：{atom['state_rule']}"
-        if atom["state_function"] == "CLAIM-RATIO":
+        if atom["state_function"] in {"RATIO", "CLAIM-RATIO"} and atom.get("empty_set_value") is not None:
             empty_value = atom.get("empty_set_value")
             rule += f"；空集合状态={empty_value}（{atom.get('empty_set_reason', '')}）"
         lines.append(

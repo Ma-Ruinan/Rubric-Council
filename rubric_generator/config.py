@@ -9,6 +9,9 @@ from pathlib import Path
 DEFAULT_MODEL = "aiaaa/deepseek-v4.1-flash#high"
 AGENT_ROLES = (
     "rubric-author",
+    "rubric-finalizer",
+    "rubric-json-repair",
+    "rubric-runtime-probe",
     "rubric-reviewer",
     "rubric-review-classifier",
     "rubric-arbitrator",

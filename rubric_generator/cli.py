@@ -28,6 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--concurrency", type=int, default=3, choices=(1, 2, 3))
     generate.add_argument("--force", action="store_true")
     generate.add_argument("--task-pattern")
+    generate.add_argument("--missing-only", action="store_true", help="只处理尚无 rubric.md 的题目")
     generate.add_argument("--limit", type=int)
     generate.add_argument("--timeout", type=int, default=900)
 
@@ -36,6 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--run-id", required=True)
     resume.add_argument("--concurrency", type=int, default=1, choices=(1, 2, 3))
     resume.add_argument("--task-pattern")
+    resume.add_argument("--missing-only", action="store_true", help="只处理尚无 rubric.md 的题目")
     resume.add_argument("--limit", type=int)
     resume.add_argument("--timeout", type=int, default=900)
 
@@ -78,6 +80,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.task_pattern:
             needle = args.task_pattern.casefold()
             tasks = [task for task in tasks if needle in str(task.relative_dir).casefold()]
+        if args.missing_only:
+            tasks = [task for task in tasks if not task.rubric_file.is_file()]
         if args.limit is not None:
             tasks = tasks[: max(0, args.limit)]
         is_resume = args.command == "resume"
@@ -87,7 +91,11 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout,
             resume=is_resume,
         ), run_id=args.run_id if is_resume else None)
-        outcomes = run.execute(tasks)
+        try:
+            outcomes = run.execute(tasks)
+        except RuntimeError as exc:
+            print(f"运行已安全停止：{exc}", file=sys.stderr, flush=True)
+            return 1
         print(json.dumps([outcome.__dict__ for outcome in outcomes], ensure_ascii=False, indent=2))
         return 0 if all(item.status in {"COMPLETED", "AUTO_FINALIZED", "SKIPPED"} for item in outcomes) else 1
 
@@ -104,7 +112,11 @@ def main(argv: list[str] | None = None) -> int:
         force=False,
         timeout_seconds=args.timeout,
     ), run_id=f"regression-{workspace.run_id}")
-    outcomes = run.execute(list(workspace.tasks))
+    try:
+        outcomes = run.execute(list(workspace.tasks))
+    except RuntimeError as exc:
+        print(f"运行已安全停止：{exc}", file=sys.stderr, flush=True)
+        return 1
     comparison = compare_regression(workspace)
     print(json.dumps({
         "workspace": str(workspace.root),

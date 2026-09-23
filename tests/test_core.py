@@ -16,8 +16,9 @@ from rubric_generator.audit import (
     audit_review_gate_payload,
 )
 from rubric_generator.config import DEFAULT_MODEL, load_project_env, load_project_settings
+from rubric_generator.cli import build_parser
 from rubric_generator.dataset import discover_tasks
-from rubric_generator.opencode_client import AgentResponse, OpenCodeClient
+from rubric_generator.opencode_client import AgentResponse, OpenCodeClient, parse_event_stream
 from rubric_generator.rubric_spec import (
     METRICS,
     audit_authoring_record_spec_alignment,
@@ -258,6 +259,33 @@ class RubricSpecTests(unittest.TestCase):
         rendered = render_rubric(spec)
         self.assertIn("空集合状态=0", rendered)
 
+    def test_ratio_may_define_empty_case_when_denominator_can_be_zero(self):
+        spec = sample_spec()
+        atom = spec["quality_metrics"]["accuracy_fidelity"]["atoms"][0]
+        atom["state_function"] = "RATIO"
+        atom["state_rule"] = "正确条目数/全部适用条目数"
+        atom["empty_set_value"] = 1
+        atom["empty_set_reason"] = "没有适用条目时不存在该类错误"
+        self.assertEqual(audit_rubric_spec(spec), [])
+        self.assertIn("空集合状态=1", render_rubric(spec))
+
+    def test_ratio_rejects_partial_empty_case_policy(self):
+        spec = sample_spec()
+        atom = spec["quality_metrics"]["accuracy_fidelity"]["atoms"][0]
+        atom["state_function"] = "RATIO"
+        atom["state_rule"] = "正确条目数/全部适用条目数"
+        atom["empty_set_value"] = 1
+        issues = audit_rubric_spec(spec)
+        self.assertTrue(any("RATIO empty-set policy requires" in issue for issue in issues))
+
+    def test_bin_still_rejects_empty_case_policy(self):
+        spec = sample_spec()
+        atom = spec["quality_metrics"]["accuracy_fidelity"]["atoms"][0]
+        atom["empty_set_value"] = 1
+        atom["empty_set_reason"] = "不应允许"
+        issues = audit_rubric_spec(spec)
+        self.assertTrue(any("BIN atom must not define" in issue for issue in issues))
+
 
 class ReviewClassificationGateTests(unittest.TestCase):
     def test_score_changing_suggestion_is_promoted(self):
@@ -311,6 +339,12 @@ class AuthoringRecordAuditTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_resume_accepts_missing_only_filter(self):
+        args = build_parser().parse_args([
+            "resume", "--dataset", "dataset", "--run-id", "run", "--missing-only",
+        ])
+        self.assertTrue(args.missing_only)
+
     def test_defaults_and_per_role_override(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -322,6 +356,8 @@ class ConfigurationTests(unittest.TestCase):
             settings = load_project_settings(root)
             self.assertEqual(settings.agent_models["rubric-reviewer"], "aiaaa/another-model#high")
             self.assertEqual(settings.agent_models["rubric-author"], DEFAULT_MODEL)
+            self.assertEqual(settings.agent_models["rubric-finalizer"], DEFAULT_MODEL)
+            self.assertEqual(settings.agent_models["rubric-runtime-probe"], DEFAULT_MODEL)
 
     def test_project_env_loads_without_overwriting_process_values(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -349,6 +385,33 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class OpenCodeClientTests(unittest.TestCase):
+    def test_incomplete_provider_error_retries_whole_agent_call(self):
+        failed = "\n".join([
+            json.dumps({"type": "text", "part": {"text": "I will read inputs."}}),
+            json.dumps({"type": "error", "error": {
+                "type": "provider.invalid-request", "message": "HTTP 400",
+            }}),
+        ]) + "\n"
+        succeeded = json.dumps({
+            "type": "text",
+            "part": {"text": "BEGIN_TEST\n{\"ok\": true}\nEND_TEST"},
+        }) + "\n"
+        completed = [
+            SimpleNamespace(returncode=1, stdout=failed, stderr=""),
+            SimpleNamespace(returncode=0, stdout=succeeded, stderr=""),
+        ]
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "rubric_generator.opencode_client.subprocess.run", side_effect=completed
+        ) as mocked_run, patch(
+            "rubric_generator.opencode_client.time.sleep"
+        ), patch(
+            "rubric_generator.opencode_client._resolve_opencode_executable", return_value="opencode"
+        ):
+            client = OpenCodeClient(Path(tmp), retries=1)
+            response = client.run_agent("rubric-author", "prompt", "title")
+            self.assertIn("BEGIN_TEST", response.text)
+            self.assertEqual(mocked_run.call_count, 2)
+
     def test_nonzero_exit_with_complete_model_output_is_validated_by_caller(self):
         event = json.dumps({
             "type": "text",
@@ -363,6 +426,37 @@ class OpenCodeClientTests(unittest.TestCase):
             client = OpenCodeClient(Path(tmp), retries=0)
             response = client.run_agent("rubric-reviewer", "prompt", "title")
             self.assertIn("BEGIN_TEST", response.text)
+
+    def test_provider_error_is_retained_separately_from_preamble_text(self):
+        raw = "\n".join([
+            json.dumps({"type": "text", "part": {"text": "I will read inputs."}}),
+            json.dumps({"type": "error", "error": {
+                "type": "provider.invalid-request", "message": "HTTP 400",
+            }}),
+        ])
+        response = parse_event_stream(raw)
+        self.assertEqual(response.text, "I will read inputs.")
+        self.assertEqual(response.terminal_error, "provider.invalid-request: HTTP 400")
+
+    def test_long_prompt_is_passed_as_attached_file_on_windows_safe_command(self):
+        event = json.dumps({
+            "type": "text",
+            "part": {"text": "BEGIN_TEST\n{\"ok\": true}\nEND_TEST"},
+        })
+        completed = SimpleNamespace(returncode=0, stdout=event + "\n", stderr="")
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "rubric_generator.opencode_client.subprocess.run", return_value=completed
+        ) as mocked_run, patch(
+            "rubric_generator.opencode_client._resolve_opencode_executable", return_value="opencode"
+        ):
+            client = OpenCodeClient(Path(tmp), retries=0)
+            long_prompt = "长" * 20_000
+            client.run_agent("rubric-arbitrator", long_prompt, "long-prompt")
+            command = mocked_run.call_args.args[0]
+            self.assertIn("--file", command)
+            self.assertNotIn(long_prompt, command)
+            prompt_path = Path(tmp) / command[command.index("--file") + 1]
+            self.assertEqual(prompt_path.read_text(encoding="utf-8"), long_prompt)
 
 
 class FakeClient:
@@ -395,6 +489,37 @@ class RunnerTests(unittest.TestCase):
     def test_final_patch_rejects_root_replacement(self):
         with self.assertRaises(ValueError):
             apply_json_patch({"kept": True}, [{"op": "replace", "path": "", "value": {}}])
+
+    def test_resume_repairs_complete_but_locally_damaged_json_response(self):
+        begin = "BEGIN_TEST_JSON"
+        end = "END_TEST_JSON"
+        damaged = (
+            f"{begin}\n"
+            '{"items":[{"id":"A",\n'
+            '"text":"truncated\n'
+            '"text":"complete"}]}\n'
+            f"{end}\n"
+        )
+        repaired = f'{begin}\n{{"items":[{{"id":"A","text":"complete"}}]}}\n{end}'
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            dataset = root / "dataset"
+            project.mkdir()
+            dataset.mkdir()
+            run = RubricRun(
+                project, dataset, RunOptions(resume=True, retries=0), run_id="repair-test"
+            )
+            run.client = FakeClient([repaired])
+            artifacts = run.run_dir / "tasks" / "task" / "artifacts"
+            artifacts.mkdir(parents=True)
+            (artifacts / "phase.response.txt").write_text(damaged, encoding="utf-8")
+            payload = run._call_json_agent(
+                "task", artifacts, "phase", "rubric-author", "unused", "unused",
+                begin, end,
+            )
+            self.assertEqual(payload["items"][0]["text"], "complete")
+            self.assertTrue((artifacts / "phase.json-repair.local.json").is_file())
 
     def test_offline_full_loop_writes_only_rubric_to_task(self):
         record = sample_record()
@@ -570,6 +695,83 @@ class RunnerTests(unittest.TestCase):
             task_status = json.loads(next((resumed.run_dir / "tasks").glob("*/status.json")).read_text(encoding="utf-8"))
             self.assertEqual(task_status["resume_count"], 1)
             self.assertNotIn("error", task_status)
+
+    def test_final_compliance_can_apply_two_bounded_corrections(self):
+        record = sample_record()
+        spec = sample_spec()
+        blocked_review = {
+            "verdict": "revision_required", "summary": "仍有分歧",
+            "blocking": [{
+                "id": "R001", "category": "determinism", "location": "T01",
+                "evidence": "规则存在歧义", "reason": "可能改变分数",
+                "required_change": "按裁决锁定",
+            }],
+            "verified": [], "suggestions": [],
+        }
+        arbitration = {
+            "summary": "保持当前合同并继续最终核验",
+            "decisions": [{
+                "issue_id": "R001", "decision": "reject",
+                "basis": "现有规则已经确定", "binding_change": "不修改",
+            }],
+            "final_instructions": ["保持当前 record 与 spec"],
+        }
+        passed_with_suggestion = {
+            "verdict": "passed", "summary": "主体可用",
+            "blocking": [], "verified": ["主体规则可计算"],
+            "suggestions": ["仍有一个可改变分数的边界歧义"],
+        }
+        gate = {
+            "verdict": "promotion_required", "summary": "需提升",
+            "promoted": [{
+                "suggestion_index": 1, "id": "G001", "category": "determinism",
+                "location": "T01", "evidence": "存在可复现反例",
+                "reason": "不同评卷人会得到不同状态", "required_change": "写死互斥边界",
+            }],
+        }
+        passed_review = {
+            "verdict": "passed", "summary": "最终合同可用",
+            "blocking": [], "verified": ["歧义已消除"], "suggestions": [],
+        }
+        no_op_replace = {
+            "record_patch": [],
+            "spec_patch": [{
+                "op": "replace", "path": "/completion/atoms/0/state_rule",
+                "value": spec["completion"]["atoms"][0]["state_rule"],
+            }],
+        }
+        empty_patch = {"record_patch": [], "spec_patch": []}
+        responses = [
+            "BEGIN_AUTHORING_RECORD_JSON\n" + json.dumps(record, ensure_ascii=False) + "\nEND_AUTHORING_RECORD_JSON",
+            "BEGIN_RUBRIC_SPEC_JSON\n" + json.dumps(spec, ensure_ascii=False) + "\nEND_RUBRIC_SPEC_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(blocked_review, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+            "BEGIN_AUTHORING_RECORD_JSON\n" + json.dumps(record, ensure_ascii=False) + "\nEND_AUTHORING_RECORD_JSON",
+            "BEGIN_RUBRIC_SPEC_JSON\n" + json.dumps(spec, ensure_ascii=False) + "\nEND_RUBRIC_SPEC_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(blocked_review, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+            "BEGIN_ARBITRATION_JSON\n" + json.dumps(arbitration, ensure_ascii=False) + "\nEND_ARBITRATION_JSON",
+            "BEGIN_FINAL_PATCH_JSON\n" + json.dumps(empty_patch) + "\nEND_FINAL_PATCH_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(passed_with_suggestion, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+            "BEGIN_REVIEW_GATE_JSON\n" + json.dumps(gate, ensure_ascii=False) + "\nEND_REVIEW_GATE_JSON",
+            "BEGIN_FINAL_PATCH_JSON\n" + json.dumps(no_op_replace) + "\nEND_FINAL_PATCH_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(passed_with_suggestion, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+            "BEGIN_REVIEW_GATE_JSON\n" + json.dumps(gate, ensure_ascii=False) + "\nEND_REVIEW_GATE_JSON",
+            "BEGIN_FINAL_PATCH_JSON\n" + json.dumps(no_op_replace) + "\nEND_FINAL_PATCH_JSON",
+            "BEGIN_REVIEW_JSON\n" + json.dumps(passed_review, ensure_ascii=False) + "\nEND_REVIEW_JSON",
+        ]
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            task_dir = root / "dataset" / "维度一" / "题目一"
+            project.mkdir(parents=True)
+            task_dir.mkdir(parents=True)
+            (task_dir / "问题描述.txt").write_text("提交一份结果", encoding="utf-8")
+            run = RubricRun(project, root / "dataset", RunOptions(concurrency=1, retries=0), run_id="two-fixes")
+            run.client = FakeClient(responses)
+            outcome = run.execute(discover_tasks(root / "dataset"))[0]
+            self.assertEqual(outcome.status, "AUTO_FINALIZED")
+            artifacts = next((run.run_dir / "tasks").glob("*/artifacts"))
+            self.assertTrue(any(artifacts.glob("author-final-correction-patch-02-*.validated.json")))
+            self.assertTrue(any(artifacts.glob("final-review-03-*.validated.json")))
 
 
 if __name__ == "__main__":
