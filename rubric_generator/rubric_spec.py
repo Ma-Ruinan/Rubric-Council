@@ -113,7 +113,7 @@ def rubric_spec_schema_example() -> dict[str, Any]:
     }
 
 
-def normalize_rubric_spec(spec: dict[str, Any]) -> list[dict[str, str]]:
+def normalize_rubric_spec(spec: dict[str, Any], record: dict[str, Any] | None = None) -> list[dict[str, str]]:
     """Normalize unambiguous presentation variants without changing scoring semantics."""
     changes: list[dict[str, str]] = []
     boundary = spec.get("evidence_boundary")
@@ -140,7 +140,7 @@ def normalize_rubric_spec(spec: dict[str, Any]) -> list[dict[str, str]]:
         for index, item in enumerate(interpretation):
             if isinstance(item, dict):
                 text = "；".join(
-                    f"{key}：{value}" for key, value in item.items()
+                    f"{_DELIVERY_LABELS.get(key, key)}：{_delivery_value(value)}" for key, value in item.items()
                     if value is not None and str(value).strip()
                 )
                 normalized_items.append(text)
@@ -152,7 +152,58 @@ def normalize_rubric_spec(spec: dict[str, Any]) -> list[dict[str, str]]:
             else:
                 normalized_items.append(item)
         spec["delivery_interpretation"] = normalized_items
+    if record is not None:
+        design = record.get("scoring_design", {})
+        planned = _record_atom_map(design) if isinstance(design, dict) else {}
+        completion = spec.get("completion")
+        groups = [("completion", completion.get("atoms", []))] if isinstance(completion, dict) else []
+        quality = spec.get("quality_metrics", {})
+        if isinstance(quality, dict):
+            groups.extend((key, value.get("atoms", [])) for key, _, _ in METRICS
+                          if isinstance(value := quality.get(key), dict))
+        for metric, atoms in groups:
+            if not isinstance(atoms, list):
+                continue
+            for atom in atoms:
+                if not isinstance(atom, dict):
+                    continue
+                locked = planned.get(str(atom.get("id")), {})
+                rule = str(locked.get("formula_or_state_rule", ""))
+                # Only remove unreachable empty-set metadata when the locked
+                # contract explicitly fixes a positive denominator and its rule
+                # is unchanged. Variable denominators and real 0/1 conflicts
+                # remain subject to ordinary validation and alignment checks.
+                fixed = re.search(r"分母\s*固定(?:为|是|=|：)\s*([1-9]\d*)\s*[：:。；,，]", rule)
+                conditional = re.search(r"不适用|剔除|扣除|减去|N/A|分母\s*(?:为|=)\s*0", rule, re.I)
+                if (fixed and not conditional and locked.get("output_metric") == metric
+                    and locked.get("state_function") == atom.get("state_function") == "RATIO"
+                    and locked.get("empty_set_value") is None
+                    and not locked.get("empty_set_reason")
+                    and _norm(atom.get("state_rule")) == _norm(rule)
+                    and (atom.get("empty_set_value") is not None or atom.get("empty_set_reason"))):
+                    before = json.dumps({"value": atom.get("empty_set_value"),
+                                         "reason": atom.get("empty_set_reason")}, ensure_ascii=False)
+                    atom["empty_set_value"] = None
+                    atom["empty_set_reason"] = ""
+                    changes.append({"path": f"{metric}.{atom.get('id')}.empty_set_policy",
+                                    "from": before,
+                                    "to": "locked fixed-denominator contract (unreachable empty set)"})
     return changes
+
+
+_DELIVERY_LABELS = {
+    "requirement_id": "对应要求", "interpretation": "交付说明",
+    "acceptable_forms": "可接受形式", "not_acceptable": "不可接受形式",
+}
+
+
+def _delivery_value(value: Any) -> str:
+    """Render explanatory values without leaking Python container syntax."""
+    if isinstance(value, list):
+        return "、".join(_delivery_value(item) for item in value)
+    if isinstance(value, dict):
+        return "；".join(f"{_DELIVERY_LABELS.get(key, key)}：{_delivery_value(item)}" for key, item in value.items())
+    return str(value)
 
 
 def audit_rubric_spec(spec: dict[str, Any], task_dir: Path | None = None) -> list[str]:

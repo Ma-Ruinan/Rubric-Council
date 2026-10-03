@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 from pathlib import Path
 
 from .rubric_spec import rubric_spec_schema_example
@@ -13,7 +15,7 @@ REPORTING_CONTRACT = """固定下游接口（不得改名、合并或替换）�
 4. 格式合规度：0.00—5.00；
 5. 结构完整度：0.00—5.00；
 6. 幻觉／自洽性：0.00—5.00。
-任务完成率回答“有没有完成题目组成”；五项质量回答“完成得怎么样”。不得再设计混合的 0—100 综合总分。每组原子权重必须各自合计 100。"""
+任务完成率回答“有没有完成题目组成”；五项质量回答“完成得怎么样”。不得再设计混合的 0—100 综合总分。每组原子权重必须各自合计 100。所有原子状态均为 0—1；状态公式不得再乘 5，五项质量的 0—5 缩放只在汇总时执行一次。"""
 
 
 def _path(path: Path, project_dir: Path) -> str:
@@ -78,15 +80,26 @@ def _record_schema() -> str:
 
 def author_analysis(project_dir: Path, task_dir: Path, material_manifest: Path, scratch_dir: Path) -> str:
     packet = _task_input_packet(task_dir, material_manifest)
+    runtime = {
+        "platform": sys.platform,
+        "shell": "PowerShell" if os.name == "nt" else "system shell",
+        "python_executable": sys.executable,
+        "working_directory": project_dir.resolve().as_posix(),
+        "scratch_directory": scratch_dir.resolve().as_posix(),
+    }
     return f"""为单道题执行解题式审题，建立内部 authoring record。不要生成 Markdown Rubric 或参考答案。
 
 以下 `AUTHOR_INPUT_JSON` 已包含完整题面和程序生成的素材清单。不要加载 Skill，也不要再次读取题面或素材清单。素材清单列有源素材时，才按其中的 `extracted_artifacts` 精确读取必要内容；素材清单为空时不得扫描目录。实时研究题可使用联网工具实际核验来源。
 
 AUTHOR_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_AUTHOR_INPUT_JSON
 
 临时计算目录（仅确需复算时使用）：{_path(scratch_dir, project_dir)}
+运行环境：{json.dumps(runtime, ensure_ascii=False)}
+复算命令必须适配上述 shell，使用给定 Python（已安装源素材解析依赖），并显式采用 UTF-8。
+Windows PowerShell 不支持 Bash 的 `python - <<'PY'` 写法；可用 PowerShell 单引号 here-string 管道给 Python `-X utf8 -`。
+只读当前题的指定素材；需要临时文件时只使用上述 scratch_directory，不读取或使用系统 Temp、其他题目或历史运行的脚本。
 
 权威顺序：当前提示和用户要求 > 问题描述与源素材 > 经核验的版本/时点事实 > 角色方法约束。
 
@@ -122,7 +135,7 @@ def author_spec(project_dir: Path, task_dir: Path, material_manifest: Path, auth
 以下 `SPEC_INPUT_JSON` 是完整输入。不要加载 Skill或读取本地路径；直接依据其中的题面、素材清单和 authoring_record 生成规格。
 
 SPEC_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_SPEC_INPUT_JSON
 
 {REPORTING_CONTRACT}
@@ -152,7 +165,7 @@ def author_record_revision(project_dir: Path, task_dir: Path, material_manifest:
 以下 `REVISION_INPUT_JSON` 是完整输入。不要加载 Skill或读取本地路径；直接完成修订。只有 blocking 明确要求重新核验实时来源时才调用联网工具。
 
 REVISION_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_REVISION_INPUT_JSON
 
 只处理 blocking；拒绝无题面或素材依据的新义务。必须逐项核对 blocking 指向的状态规则和来源，不得用增加引用 ID 代替修复可执行判据。除非 blocking 证明评分契约错误，否则保留稳定 ID、指标归属、层、权重、状态函数和公式。{REPORTING_CONTRACT}
@@ -175,7 +188,7 @@ def author_spec_revision(project_dir: Path, task_dir: Path, material_manifest: P
 以下 `SPEC_REVISION_INPUT_JSON` 是完整输入。不要加载 Skill或读取本地路径；直接输出修订规格。
 
 SPEC_REVISION_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_SPEC_REVISION_INPUT_JSON
 
 只落实 blocking 与修订后 record。保持固定六项接口和自包含要求；再次检查 mandatory 要求真实计分、CLAIM-RATIO 与可能出现零分母的 RATIO 空集合、阈值来源、K/A 命名空间及严重封顶的实质性条件。只输出：
@@ -190,7 +203,7 @@ def review(project_dir: Path, task_dir: Path, material_manifest: Path, authoring
         **_task_input_packet(task_dir, material_manifest),
         "authoring_record": _json_file(authoring_record),
         "rubric_spec": _json_file(spec_file),
-        "rendered_rubric": rubric_file.read_text(encoding="utf-8"),
+        "rendered_rubric_lines": rubric_file.read_text(encoding="utf-8").splitlines(),
         "previous_review": _json_file(previous_review) if previous_review else None,
         "arbitration": _json_file(arbitration_file) if arbitration_file else None,
     }
@@ -209,7 +222,7 @@ def review(project_dir: Path, task_dir: Path, material_manifest: Path, authoring
 以下 `REVIEW_INPUT_JSON` 已包含题面、素材清单和全部候选产物。不要加载 Skill或重复读取这些本地文件。仅在首次核验实时来源、来源发生变化或 blocking 涉及来源时调用联网工具。
 
 REVIEW_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_REVIEW_INPUT_JSON
 
 检查：题意和锚点；时间公平；完成率与质量是否分离；六项结果是否各自可计算；五项质量是否题目原生且无填充义务；原子与 record 是否一致；分母、空集合、零分条件和证据是否明确；同一指标内是否重复扣分；开放结论是否被错误收窄；最终 Rubric 是否只引用数据集真实输入或外部来源。逐项检查外部来源是否为结构化独立条目、是否使用完整可点击 HTTPS URL、页面是否实际打开且直接支持声明；不可访问来源是否有替代证据且没有单独支撑关键锚点。程序固定章节的措辞或样式偏好不得 blocking。
@@ -232,7 +245,7 @@ def classify_review(
         "problem": (task_dir / "问题描述.txt").read_text(encoding="utf-8-sig"),
         "authoring_record": _json_file(authoring_record),
         "rubric_spec": _json_file(spec_file),
-        "rendered_rubric": rubric_file.read_text(encoding="utf-8"),
+        "rendered_rubric_lines": rubric_file.read_text(encoding="utf-8").splitlines(),
         "raw_review": _json_file(raw_review_file),
     }
     return f"""对 Reviewer 已写入 suggestions 的项目执行独立严重性分类门禁。不要重新审核整份 Rubric，不得发现或新增原审核未提到的问题。
@@ -240,7 +253,7 @@ def classify_review(
 以下 `REVIEW_GATE_INPUT_JSON` 是完整输入。不得加载 Skill、读取路径或调用其他工具。
 
 REVIEW_GATE_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_REVIEW_GATE_INPUT_JSON
 
 逐条读取 suggestions。只有在现有 Rubric 文本中能够给出一个具体交付情形，并证明该情形必然导致错误原子状态、明确分数差、错误封顶或两名评卷人按现有规则得出不同结果时，才可提升。必须在 evidence/reason 中写清具体反例和受影响的原子；“可能”“建议进一步明确”“存在部分重叠”或纯推测不足以提升。
@@ -305,7 +318,7 @@ def arbitrate(project_dir: Path, task_dir: Path, material_manifest: Path, curren
 以下 `ARBITRATION_INPUT_JSON` 已由程序从通过校验的检查点生成，是本次裁决的完整输入。不得调用工具或读取路径；直接根据其中的题面、锚点、评分合同和审核记录裁决。
 
 ARBITRATION_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_ARBITRATION_INPUT_JSON
 
 以题目、真实素材和已核验锚点为准。拒绝无依据的新义务、阈值和审美偏好；固定六项输出接口不得改变。只输出约定的 BEGIN_ARBITRATION_JSON / END_ARBITRATION_JSON JSON。
@@ -332,7 +345,7 @@ def author_final_patch(project_dir: Path, task_dir: Path, material_manifest: Pat
 以下 `FINALIZATION_INPUT_JSON` 是程序从已通过校验的检查点生成的完整输入。不得调用工具、加载 Skill 或读取任何路径；直接对其中的 current_record 与 current_spec 生成补丁。
 
 FINALIZATION_INPUT_JSON
-{json.dumps(packet, ensure_ascii=False, separators=(",", ":"))}
+{json.dumps(packet, ensure_ascii=False, indent=2)}
 END_FINALIZATION_INPUT_JSON
 
 要求：

@@ -1,12 +1,20 @@
 ---
 description: 独立核查单道题目的候选 Rubric，发现题意偏差、不可计算原子、遗漏、重复扣分和时间不公平
-mode: subagent
+mode: all
 hidden: true
 model: aiaaa/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 45
 permission:
+  read:
+    "*": allow
+    "*.env": deny
+    "*.env.*": deny
+    "*.env.example": allow
+    ".rubric-generator/runs/*/tasks/*/scratch/**": allow
+    "*/.rubric-generator/runs/*/tasks/*/scratch/**": allow
+    '*\.rubric-generator\runs\*\tasks\*\scratch\**': allow
   edit: deny
   bash: deny
   external_directory: deny
@@ -50,3 +58,5 @@ BEGIN_REVIEW_JSON
 END_REVIEW_JSON
 
 当且仅当 `blocking` 为空时，`verdict` 才能是 `passed`。
+
+输入隔离：只使用当前提示及其指定路径。不得读写系统 Temp 或其他运行/题目的临时文件；需要本题复算临时文件时只用提示提供的 scratch 目录。提示以附件传入时可完整分段读取该附件，但不得因此扫描其他文件。

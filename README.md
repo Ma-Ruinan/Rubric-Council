@@ -2,10 +2,6 @@
 
 面向 AI Agent 测评数据集的题目级 Rubric 生成器。输入目录中的每道题由 `问题描述.txt` 和可选源素材组成；成功后仅把 `rubric.md` 写回题目目录，完整制作、审核、修订和裁决留痕保存在项目的 `.rubric-generator/runs/`。
 
-## Pipeline
-
-![Rubric Council Pipeline](./Rubric_Council_pipeline.png)
-
 ## 输出接口
 
 每道题的 Rubric 固定输出：
@@ -26,7 +22,7 @@
 3. 程序检查 ID、六组权重、状态函数、真实输入路径及 record/spec 对齐，然后确定性渲染候选 `rubric.md`。
 4. Reviewer 独立核查题意、锚点、可计算性、开放答案公平性和自包含性。
 5. Reviewer 已判定通过但仍有 suggestions 时，独立 Classification Gate 才复核其严重性；只有存在具体、可复现评分后果的项目才提升为 blocking。
-6. 最多一轮 Reviewer 定向修改；仍有阻断分歧时由 Arbitrator 作一次绑定裁决。裁决后只生成并应用最小 JSON Patch，不重新输出整份大型 record/spec；最终合规阶段最多允许两次窄范围修正，且每次均按候选内容隔离检查点。
+6. 最多一轮定向修改；仍有阻断分歧时由 Arbitrator 作一次绑定裁决。裁决后只生成并应用最小 JSON Patch，不重新输出整份大型 record/spec。
 7. 每个通过机器校验的阶段立即保存为检查点；通过最终静态检查后原子写入题目目录，中间文件留在项目运行目录。
 
 Reviewer 只报告会造成错误评分或无法可靠执行的问题。措辞、排版偏好和“为了更完整”的新增要求不能成为阻断项。
@@ -38,7 +34,7 @@ Reviewer 只报告会造成错误评分或无法可靠执行的问题。措辞�
 需要 Python 3.11+、[uv](https://docs.astral.sh/uv/) 和 OpenCode。进入项目目录后运行：
 
 ```bash
-cd Rubric-Council
+cd /d/mywork/rubric-generator-v1.0
 uv sync
 ```
 
@@ -144,3 +140,17 @@ uv run python -m unittest discover -s tests -v
 ```
 
 `opencode.jsonc` 与运行产物已被 `.gitignore` 排除；可提交 `opencode.example.jsonc` 和 `rubric-generator.toml`，供其他使用者配置自己的密钥和模型。
+
+### OpenCode CLI 兼容配置
+
+默认沿用 OpenCode 2.x 的 `--standalone` 调用。若中转接口不支持该版本的请求字段，可在本地 `.env` 中设置 `OPENCODE_BIN` 为已安装的 OpenCode 1.x 原生可执行文件，并设置 `OPENCODE_RUN_MODE=legacy`。兼容模式会将模型配置中的 `#high` 转为 `--variant high`，并使用该版本支持的命令参数；模型与判别流程不变。运行前仍须通过真实工具续写探针。长提示使用附件，附件与消息之间显式分隔，避免 CLI 将消息误当作文件路径。
+
+常规能力测试数据集仅包含问题描述、源素材和生成的 rubric；交付文件与历史评分不作为生成输入，整个数据集目录已加入 Git 忽略规则。
+
+兼容模式的会话数据库、缓存和全局配置隔离在 `.rubric-generator/opencode-legacy/`，不修改系统 OpenCode 的已有状态。OpenCode 1.x 需要 `provider` / `npm` / `options` 形式的本地配置（可参考本项目 `opencode.v1.example.jsonc`）；2.x 则使用原有 `providers` / `package` / `settings`。角色使用 `mode: all`，允许程序直接调用，同时保留子角色调用能力，避免 1.x 把指定角色替换为默认编排角色。
+
+结构化候选的规范化只修复不改变评分含义的表达问题。例如，已验证记录明确规定固定正分母、候选原子规则与其完全一致时，会移除不可达空集合的冗余说明；可变分母、实际空集合策略及评分规则冲突仍由审计阻止。每次规范化保留修改记录，最终 rubric 仍须通过独立审核和计算性审计。
+
+接口超时或明确报告输出长度上限时，在有剩余重试次数且可取得会话 ID 的情况下，程序复用已完成的工具核验；截断输出会要求重新返回精简、完整的阶段结果，不拼接残缺 JSON。若超时前已获得完整标记结果，则继续正常内容校验。脱敏事件保存在 `.rubric-generator/call-diagnostics/`，失败题目可通过 `resume --missing-only` 恢复，已完成 rubric 不重跑。
+
+若模型只返回单个完整合法 JSON 对象而遗漏外层标记，程序允许继续校验；残缺标记、夹杂说明、多个对象仍触发重试。公开源码核验允许作者和审核角色读取本题 scratch 副本中的环境示例文件，兼容新旧 CLI 路径匹配；项目自身 `.env` 等真实配置仍保持禁止读取。

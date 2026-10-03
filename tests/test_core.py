@@ -18,7 +18,7 @@ from rubric_generator.audit import (
 from rubric_generator.config import DEFAULT_MODEL, load_project_env, load_project_settings
 from rubric_generator.cli import build_parser
 from rubric_generator.dataset import discover_tasks
-from rubric_generator.opencode_client import AgentResponse, OpenCodeClient, parse_event_stream
+from rubric_generator.opencode_client import AgentResponse, OpenCodeClient, OpenCodeError, extract_json, parse_event_stream
 from rubric_generator.rubric_spec import (
     METRICS,
     audit_authoring_record_spec_alignment,
@@ -239,6 +239,47 @@ class RubricSpecTests(unittest.TestCase):
         issues = audit_rubric_spec(spec)
         self.assertTrue(any("internal build reference" in issue for issue in issues))
 
+    def test_delivery_object_preserves_conditions_as_readable_text(self):
+        spec = sample_spec()
+        spec["delivery_interpretation"] = [{
+            "requirement_id": "REQ01", "interpretation": "需要独立文件",
+            "acceptable_forms": ["PDF", "DOCX"], "not_acceptable": ["空文件", "仅聊天"]
+        }]
+        normalize_rubric_spec(spec)
+        rendered = render_rubric(spec)
+        self.assertIn("可接受形式：PDF、DOCX", rendered)
+        self.assertIn("不可接受形式：空文件、仅聊天", rendered)
+        self.assertIn("对应要求：REQ01", rendered)
+        self.assertNotIn("acceptable_forms", rendered)
+        self.assertNotIn("['PDF'", rendered)
+
+    def test_fixed_denominator_metadata_is_canonical_without_changing_rule(self):
+        record, spec = sample_record(), sample_spec()
+        planned = record["scoring_design"]["quality_metrics"]["structure_integrity"][0]
+        actual = spec["quality_metrics"]["structure_integrity"]["atoms"][0]
+        rule = "分母固定为 7：七类区域。state=可辨识区域数/7。"
+        planned.update(state_function="RATIO", formula_or_state_rule=rule)
+        actual.update(state_function="RATIO", state_rule=rule, empty_set_value=0,
+                      empty_set_reason="分母恒为7，空集合不触发")
+        changes = normalize_rubric_spec(spec, record)
+        self.assertTrue(changes)
+        self.assertEqual(actual["state_rule"], rule)
+        self.assertIsNone(actual["empty_set_value"])
+        self.assertEqual(audit_authoring_record_spec_alignment(record, spec), [])
+
+    def test_variable_denominator_policy_conflicts_are_not_normalized(self):
+        record, spec = sample_record(), sample_spec()
+        planned = record["scoring_design"]["quality_metrics"]["structure_integrity"][0]
+        actual = spec["quality_metrics"]["structure_integrity"]["atoms"][0]
+        rule = "state=有效条目数/适用条目数。"
+        planned.update(state_function="RATIO", formula_or_state_rule=rule,
+                       empty_set_value=1, empty_set_reason="无适用项时无缺陷")
+        actual.update(state_function="RATIO", state_rule=rule,
+                      empty_set_value=0, empty_set_reason="无适用项时无证据")
+        normalize_rubric_spec(spec, record)
+        self.assertEqual(actual["empty_set_value"], 0)
+        self.assertIn("atom S01 differs on empty_set_value", audit_authoring_record_spec_alignment(record, spec))
+
     def test_claim_ratio_requires_empty_case(self):
         spec = sample_spec()
         atom = spec["quality_metrics"]["accuracy_fidelity"]["atoms"][0]
@@ -385,6 +426,101 @@ class ConfigurationTests(unittest.TestCase):
 
 
 class OpenCodeClientTests(unittest.TestCase):
+    def test_runtime_probes_use_independent_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            client = OpenCodeClient(Path(tmp), retries=0)
+            def reply(agent, prompt, title):
+                import re
+                relative = re.search(r"读取 `([^`]+)`", prompt).group(1)
+                nonce = (Path(tmp) / relative).read_text(encoding="utf-8").strip()
+                text = 'BEGIN_RUNTIME_PROBE\n' + json.dumps({"nonce": nonce}) + '\nEND_RUNTIME_PROBE'
+                event = json.dumps({"part": {"tool": "read", "state": {"status": "completed"}}})
+                return AgentResponse(text, (), event)
+            with patch.object(client, "run_agent", side_effect=reply):
+                client.check_tool_roundtrip()
+                client.check_tool_roundtrip()
+            files = list((Path(tmp) / ".rubric-generator/runtime-probe").glob("*.txt"))
+            self.assertEqual(len(files), 2)
+            self.assertNotEqual(files[0].read_text(), files[1].read_text())
+
+    def test_timeout_resumes_session_and_preserves_private_diagnostics(self):
+        import subprocess
+        partial = json.dumps({"type": "step_start", "sessionID": "ses_resume"}) + "\n"
+        answer = json.dumps({"type": "text", "part": {"text": "BEGIN_TEST\n{}\nEND_TEST"}})
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "rubric_generator.opencode_client.subprocess.run", side_effect=[
+                subprocess.TimeoutExpired(["opencode"], 1, output=partial.encode()),
+                SimpleNamespace(returncode=0, stdout=answer, stderr="")
+            ]
+        ) as run, patch("rubric_generator.opencode_client.time.sleep"):
+            client = OpenCodeClient(Path(tmp), timeout_seconds=1, retries=1)
+            self.assertIn("BEGIN_TEST", client.run_agent("rubric-author", "prompt", "timeout").text)
+            self.assertIn("--session", run.call_args.args[0])
+            self.assertEqual(run.call_args.args[0][run.call_args.args[0].index("--session") + 1], "ses_resume")
+            files = list((Path(tmp) / ".rubric-generator/call-diagnostics").glob("*.jsonl"))
+            self.assertEqual(files[0].read_text(encoding="utf-8"), partial)
+
+    def test_legacy_error_exposes_nested_gateway_message(self):
+        raw = json.dumps({"type": "error", "error": {
+            "name": "APIError", "data": {"message": "HTTP 400 unsupported field"}
+        }})
+        self.assertEqual(parse_event_stream(raw).terminal_error, "APIError: HTTP 400 unsupported field")
+
+    def test_complete_unwrapped_json_keeps_content_and_rejects_partial_wrappers(self):
+        for text in ('{"value":7}', '```json\n{"value":7}\n```'):
+            self.assertEqual(extract_json(text, "BEGIN_TEST", "END_TEST"), {"value": 7})
+        for text in ('BEGIN_TEST\n{"value":7}', '{"value":7}\nEND_TEST',
+                     'Here is the answer: {"value":7}', '{"value":7}\n{"other":8}', '[7]'):
+            with self.assertRaises(OpenCodeError):
+                extract_json(text, "BEGIN_TEST", "END_TEST")
+
+    def test_output_limit_reuses_session_without_merging_truncated_json(self):
+        truncated = "\n".join([
+            json.dumps({"type": "text", "sessionID": "ses_limit", "part": {"text": "BEGIN_TEST\n{\"x\":"}}),
+            json.dumps({"type": "step_finish", "part": {"reason": "length"}}),
+        ])
+        complete = json.dumps({"type": "text", "part": {"text": "BEGIN_TEST\n{\"x\":1}\nEND_TEST"}})
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "rubric_generator.opencode_client.subprocess.run", side_effect=[
+                SimpleNamespace(returncode=0, stdout=truncated, stderr=""),
+                SimpleNamespace(returncode=0, stdout=complete, stderr=""),
+            ]
+        ) as run:
+            client = OpenCodeClient(Path(tmp), retries=1)
+            response = client.run_agent("rubric-author", "prompt", "limit")
+            self.assertEqual(response.text, "BEGIN_TEST\n{\"x\":1}\nEND_TEST")
+            command = run.call_args.args[0]
+            self.assertEqual(command[command.index("--session") + 1], "ses_limit")
+            self.assertEqual(len(list((Path(tmp)/".rubric-generator/call-diagnostics").glob("*.length-*.jsonl"))), 1)
+
+    def test_complete_payload_at_output_limit_is_not_repeated(self):
+        raw = "\n".join([
+            json.dumps({"type": "text", "sessionID": "ses_limit", "part": {"text": "BEGIN_TEST\n{}\nEND_TEST"}}),
+            json.dumps({"type": "step_finish", "part": {"reason": "length"}}),
+        ])
+        with tempfile.TemporaryDirectory() as tmp, patch(
+            "rubric_generator.opencode_client.subprocess.run",
+            return_value=SimpleNamespace(returncode=0, stdout=raw, stderr=""),
+        ) as run:
+            OpenCodeClient(Path(tmp), retries=1).run_agent("rubric-author", "prompt", "limit")
+            self.assertEqual(run.call_count, 1)
+
+    def test_legacy_cli_separates_variant_and_file_message(self):
+        event = json.dumps({"type": "text", "part": {"text": "BEGIN_TEST\n{}\nEND_TEST"}})
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ", {"OPENCODE_RUN_MODE": "legacy"}
+        ), patch("rubric_generator.opencode_client.subprocess.run", return_value=SimpleNamespace(
+            returncode=0, stdout=event, stderr=""
+        )) as run:
+            client = OpenCodeClient(Path(tmp), retries=0, model_by_agent={"rubric-author": "provider/model#high"})
+            client.run_agent("rubric-author", "x" * 20000, "legacy")
+            command = run.call_args.args[0]
+            self.assertNotIn("--standalone", command)
+            self.assertEqual(command[command.index("--model") + 1], "provider/model")
+            self.assertEqual(command[command.index("--variant") + 1], "high")
+            self.assertEqual(command[command.index("--file") + 2], "--")
+            self.assertTrue(run.call_args.kwargs["env"]["XDG_DATA_HOME"].startswith(tmp))
+
     def test_incomplete_provider_error_retries_whole_agent_call(self):
         failed = "\n".join([
             json.dumps({"type": "text", "part": {"text": "I will read inputs."}}),

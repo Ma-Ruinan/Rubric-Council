@@ -540,7 +540,7 @@ class RubricRun:
         normalization_changes: list[dict[str, str]] = []
 
         def validate(spec: dict[str, object]) -> list[str]:
-            normalization_changes.extend(normalize_rubric_spec(spec))
+            normalization_changes.extend(normalize_rubric_spec(spec, record))
             rendered_issues, _ = audit_rendered_rubric(render_rubric(spec))
             return [
                 *audit_rubric_spec(spec, task_dir),

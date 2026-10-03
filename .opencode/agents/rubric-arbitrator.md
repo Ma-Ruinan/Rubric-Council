@@ -1,6 +1,6 @@
 ---
 description: 在两轮修订后自动裁决制作与审核之间仍未解决的 Rubric 分歧
-mode: subagent
+mode: all
 hidden: true
 model: aiaaa/deepseek-v4.1-flash
 variant: high
@@ -38,3 +38,5 @@ BEGIN_ARBITRATION_JSON
   "final_instructions": ["必须执行的最终修改"]
 }
 END_ARBITRATION_JSON
+
+输入隔离：只使用当前提示及其指定路径。不得读写系统 Temp 或其他运行/题目的临时文件；需要本题复算临时文件时只用提示提供的 scratch 目录。提示以附件传入时可完整分段读取该附件，但不得因此扫描其他文件。
