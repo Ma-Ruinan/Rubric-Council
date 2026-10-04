@@ -57,6 +57,7 @@ class RunOptions:
     timeout_seconds: int = 900
     retries: int = 1
     resume: bool = False
+    refresh_reviews: bool = False
 
 
 @dataclass
@@ -505,6 +506,7 @@ class RubricRun:
         if cached is not None:
             self._log(f"[{task_id}] {phase} 使用已校验检查点")
             return cached
+        prompt = self._refresh_rejected_stage(task_id, artifacts, phase, prompt, audit_authoring_record, "authoring record")
         issues: list[str] = []
         for attempt in range(self.options.max_schema_retries + 1):
             suffix = "" if attempt == 0 else f".schema-retry-{attempt:02d}"
@@ -541,12 +543,16 @@ class RubricRun:
 
         def validate(spec: dict[str, object]) -> list[str]:
             normalization_changes.extend(normalize_rubric_spec(spec, record))
-            rendered_issues, _ = audit_rendered_rubric(render_rubric(spec))
-            return [
+            issues = [
                 *audit_rubric_spec(spec, task_dir),
                 *audit_authoring_record_spec_alignment(record, spec),
-                *rendered_issues,
             ]
+            if issues:
+                return issues
+            try:
+                return audit_rendered_rubric(render_rubric(spec))[0]
+            except (KeyError, TypeError, ValueError) as exc:
+                return [f"rubric rendering failed after structural validation: {exc}"]
 
         result = self._call_validated_json_agent(
             task_id, artifacts, phase, "rubric-author", prompt, title,
@@ -582,12 +588,17 @@ class RubricRun:
                 record, spec = self._apply_final_patch_files(record_file, spec_file, payload)
             except (KeyError, IndexError, TypeError, ValueError) as exc:
                 return [f"patch application failed: {exc}"]
-            return [
+            issues = [
                 *audit_authoring_record(record),
                 *audit_rubric_spec(spec, task_dir),
                 *audit_authoring_record_spec_alignment(record, spec),
-                *audit_rendered_rubric(render_rubric(spec))[0],
             ]
+            if issues:
+                return issues
+            try:
+                return audit_rendered_rubric(render_rubric(spec))[0]
+            except (KeyError, TypeError, ValueError) as exc:
+                return [f"patched rubric rendering failed after structural validation: {exc}"]
 
         return self._call_validated_json_agent(
             task_id, artifacts, phase, "rubric-finalizer", prompt, title,
@@ -608,10 +619,22 @@ class RubricRun:
         payload_name: str,
     ) -> dict[str, object]:
         checkpoint = artifacts / f"{phase}.validated.json"
+        if self.options.refresh_reviews and agent in {
+            "rubric-reviewer", "rubric-review-classifier", "rubric-arbitrator", "rubric-finalizer",
+        }:
+            prior_files = [p for p in artifacts.iterdir() if p.is_file() and p.name.startswith(phase + ".")]
+            if prior_files:
+                history = artifacts / "review-refresh" / phase / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+                history.mkdir(parents=True, exist_ok=True)
+                for path in prior_files:
+                    path.replace(history / path.name)
+                self._log(f"[{task_id}] {phase} 保留旧留痕并刷新审核；审题和规格检查点不受影响")
         cached = self._read_checkpoint(checkpoint, validator)
         if cached is not None:
             self._log(f"[{task_id}] {phase} 使用已校验检查点")
             return cached
+        prompt = self._refresh_rejected_stage(task_id, artifacts, phase, prompt, validator, payload_name,
+                                              inline_invalid=agent == "rubric-finalizer")
         issues: list[str] = []
         for attempt in range(self.options.max_schema_retries + 1):
             suffix = "" if attempt == 0 else f".schema-retry-{attempt:02d}"
@@ -633,6 +656,28 @@ class RubricRun:
                 return payload
             self._write_json(artifacts / f"{phase}.schema-invalid-{attempt:02d}.json", payload)
         raise OpenCodeError(f"Invalid {payload_name} after bounded correction: " + "; ".join(issues))
+
+    def _refresh_rejected_stage(
+        self, task_id: str, artifacts: Path, phase: str, prompt: str,
+        validator: Callable[[dict[str, object]], list[str]], payload_name: str,
+        *, inline_invalid: bool = False,
+    ) -> str:
+        """A rejected response is diagnostic history, never a reusable checkpoint."""
+        rejected = sorted(artifacts.glob(f"{phase}.schema-invalid-*.json"))
+        if not self.options.resume or not rejected:
+            return prompt
+        latest = rejected[-1]
+        payload = json.loads(latest.read_text(encoding="utf-8"))
+        issues = validator(payload)
+        history = artifacts / "rejected-resume" / phase / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        history.mkdir(parents=True, exist_ok=True)
+        for path in list(artifacts.iterdir()):
+            if path.is_file() and path.name.startswith(phase + "."):
+                path.replace(history / path.name)
+        self._log(f"[{task_id}] {phase} 上次未通过校验，保留旧响应并重新生成失败阶段")
+        return prompt + self._schema_correction_instruction(
+            history / latest.name, issues, payload_name, inline_invalid=inline_invalid,
+        )
 
     def _read_checkpoint(
         self,

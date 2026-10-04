@@ -17,6 +17,13 @@ dependencies = [
   "python-pptx>=1.0,<2",
 ]
 
+[project.optional-dependencies]
+analysis = [
+  "numpy>=2,<3",
+  "scipy>=1.15,<2",
+  "pandas>=2.2,<4",
+]
+
 [project.scripts]
 rubric-generator = "rubric_generator.cli:main"
 

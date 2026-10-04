@@ -14,6 +14,7 @@ from rubric_generator.audit import (
     audit_authoring_record,
     audit_file,
     audit_review_gate_payload,
+    audit_review_payload,
 )
 from rubric_generator.config import DEFAULT_MODEL, load_project_env, load_project_settings
 from rubric_generator.cli import build_parser
@@ -206,7 +207,8 @@ class RubricSpecTests(unittest.TestCase):
         spec = sample_spec()
         spec["completion"]["atoms"][0]["requirement_or_anchor_ids"] = ["REQ02"]
         issues = audit_authoring_record_spec_alignment(sample_record(), spec)
-        self.assertIn("atom T01 differs on requirement_or_anchor_ids", issues)
+        self.assertTrue(any(issue.startswith("atom T01 differs on requirement_or_anchor_ids") for issue in issues))
+        self.assertIn("expected ['REQ01'], observed ['REQ02']", issues[0])
 
     def test_record_and_spec_wording_differences_do_not_block(self):
         spec = sample_spec()
@@ -606,6 +608,67 @@ class FakeClient:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_resume_rejected_spec_refreshes_only_failed_stage_and_then_reuses_valid_checkpoint(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); project = root / "project"; project.mkdir()
+            task = root / "dataset" / "task"; task.mkdir(parents=True)
+            (task / "问题描述.txt").write_text("提交一份结果", encoding="utf-8")
+            artifacts = project / "artifacts"; artifacts.mkdir()
+            record, valid = sample_record(), sample_spec()
+            invalid = json.loads(json.dumps(valid))
+            invalid["completion"]["atoms"][0]["requirement_or_anchor_ids"] = ["K01"]
+            phase = "spec"
+            (artifacts / f"{phase}.response.txt").write_text("BEGIN_RUBRIC_SPEC_JSON\n"+json.dumps(invalid)+"\nEND_RUBRIC_SPEC_JSON")
+            (artifacts / f"{phase}.schema-invalid-00.json").write_text(json.dumps(invalid))
+            (artifacts / "author.validated.json").write_text(json.dumps(record))
+            run = RubricRun(project, root / "dataset", RunOptions(resume=True, retries=0), run_id="rejected-resume-test")
+            run.client = FakeClient(["BEGIN_RUBRIC_SPEC_JSON\n"+json.dumps(valid)+"\nEND_RUBRIC_SPEC_JSON"])
+            result = run._call_rubric_spec("task", artifacts, phase, "author", "test", task, record)
+            self.assertEqual(result, valid)
+            history = list((artifacts / "rejected-resume").rglob("spec.response.txt"))
+            self.assertEqual(len(history), 1)
+            self.assertIn('"K01"', history[0].read_text())
+            self.assertEqual(json.loads((artifacts / "author.validated.json").read_text()), record)
+            run.client = FakeClient([])
+            result = run._call_rubric_spec("task", artifacts, phase, "author", "test", task, record)
+            self.assertEqual(result, valid)
+
+    def test_final_patch_validates_missing_fields_before_rendering_and_repairs_boundedly(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); project = root / "project"; project.mkdir()
+            task = root / "dataset" / "task"; task.mkdir(parents=True)
+            (task / "问题描述.txt").write_text("提交一份结果", encoding="utf-8")
+            artifacts = project / "artifacts"; artifacts.mkdir()
+            record = artifacts / "record.json"; record.write_text(json.dumps(sample_record()), encoding="utf-8")
+            spec = artifacts / "spec.json"; spec.write_text(json.dumps(sample_spec()), encoding="utf-8")
+            invalid = {"record_patch": [], "spec_patch": [{"op": "remove", "path": "/completion/atoms/0/layer"}]}
+            valid = {"record_patch": [], "spec_patch": []}
+            run = RubricRun(project, root / "dataset", RunOptions(retries=0), run_id="patch-validation")
+            run.client = FakeClient(["BEGIN_FINAL_PATCH_JSON\n"+json.dumps(p)+"\nEND_FINAL_PATCH_JSON" for p in (invalid, valid)])
+            result = run._call_final_patch("task", artifacts, "patch", "repair", "test", task, record, spec)
+            self.assertEqual(result, valid)
+            self.assertTrue((artifacts / "patch.schema-invalid-00.json").exists())
+            self.assertEqual(json.loads(spec.read_text())["completion"]["atoms"][0]["layer"], "objective_verifiable")
+
+    def test_review_refresh_archives_prior_outputs_and_keeps_author_checkpoints(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); project = root / "project"; project.mkdir()
+            artifacts = project / "artifacts"; artifacts.mkdir()
+            old = {"verdict": "passed", "summary": "old", "blocking": [], "verified": [], "suggestions": []}
+            fresh = {**old, "summary": "fresh"}
+            (artifacts / "review.validated.json").write_text(json.dumps(old))
+            (artifacts / "review.response.txt").write_text("BEGIN_REVIEW_JSON\n"+json.dumps(old)+"\nEND_REVIEW_JSON")
+            (artifacts / "author.validated.json").write_text(json.dumps({"preserved": True}))
+            run = RubricRun(project, root / "dataset", RunOptions(resume=True, refresh_reviews=True, retries=0), run_id="refresh-test")
+            run.client = FakeClient(["BEGIN_REVIEW_JSON\n"+json.dumps(fresh)+"\nEND_REVIEW_JSON"])
+            result = run._call_validated_json_agent("task", artifacts, "review", "rubric-reviewer", "review", "test", "BEGIN_REVIEW_JSON", "END_REVIEW_JSON", audit_review_payload, "review")
+            self.assertEqual(result["summary"], "fresh")
+            archived = list((artifacts / "review-refresh").rglob("review.validated.json"))
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(json.loads(archived[0].read_text())["summary"], "old")
+            result = run._call_validated_json_agent("task", artifacts, "author", "rubric-author", "author", "test", "BEGIN_RECORD", "END_RECORD", lambda payload: [], "author")
+            self.assertEqual(result, {"preserved": True})
+
     def test_default_allows_only_one_reviewer_directed_revision(self):
         self.assertEqual(RunOptions().max_revision_rounds, 1)
 

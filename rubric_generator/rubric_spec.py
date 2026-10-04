@@ -470,7 +470,7 @@ def audit_authoring_record_spec_alignment(record: dict[str, Any], spec: dict[str
                 expected_refs = sorted(str(value) for value in expected or [])
                 observed_refs = sorted(str(value) for value in observed or [])
                 if expected_refs != observed_refs:
-                    issues.append(f"atom {atom_id} differs on {record_key}")
+                    issues.append(f"atom {atom_id} differs on {record_key}: expected {expected_refs}, observed {observed_refs}")
             elif record_key == "empty_set_value":
                 if expected != observed:
                     issues.append(f"atom {atom_id} differs on {record_key}")

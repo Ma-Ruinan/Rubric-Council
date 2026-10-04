@@ -17,6 +17,10 @@
 
 ## 工作流
 
+![Rubric Council pipeline](Rubric_Council_pipeline.png)
+
+流程图用于概览。实际编排由 Python 程序执行，默认最多一轮定向修改；Gate 与裁决的触发条件见下文。
+
 1. Author 对单题执行“解题式审题”，形成内部 `authoring record`。
 2. Author 根据该记录生成结构化 `Rubric Spec`，不自由编排 Markdown。
 3. 程序检查 ID、六组权重、状态函数、真实输入路径及 record/spec 对齐，然后确定性渲染候选 `rubric.md`。
@@ -26,6 +30,8 @@
 7. 每个通过机器校验的阶段立即保存为检查点；通过最终静态检查后原子写入题目目录，中间文件留在项目运行目录。
 
 Reviewer 只报告会造成错误评分或无法可靠执行的问题。措辞、排版偏好和“为了更完整”的新增要求不能成为阻断项。
+
+数值规则遵守题面规定的精度；未规定精度时，制作与审核角色核查足以支持任务结论的合法舍入，避免任意固定绝对误差暗中增加小数位数要求。建议分类门禁也以具体舍入反例判断是否会误罚，不会仅因某个容差可计算便忽略错误评分。
 
 最终 `rubric.md` 始终由结构化 Rubric Spec 确定性渲染，因此章节顺序、编号、六项结果接口和评分表结构保持一致。中间结构中的同义措辞或可自动规范化差异不会触发整份 Rubric 重写；权重、状态函数、来源、自包含性和可计算性仍是硬约束。
 
@@ -37,6 +43,8 @@ Reviewer 只报告会造成错误评分或无法可靠执行的问题。措辞�
 cd /d/mywork/rubric-generator-v1.0
 uv sync
 ```
+
+统计分析类题目可安装可选复算依赖：`uv sync --extra analysis`。这会提供 NumPy、SciPy 和 pandas，用于从源素材核验统计检验、相关系数等客观锚点；普通题目的默认安装不变。
 
 仓库提供 `opencode.example.jsonc`，其中配置了 AI·AAA 的 OpenAI 兼容端点。首次使用时复制为被 Git 忽略的本机配置：
 
@@ -95,6 +103,8 @@ uv run rubric-generator resume \
 默认跳过已有 `rubric.md`。确认需要重做时加 `--force`；原版本会备份到当次运行留痕中。
 
 某次运行中断或后期校验失败时，可用原 run ID 从已校验检查点继续。已经完成的审题、规格、审核、修改和裁决不会再次调用模型：
+
+若修正了审核角色的规则，需要重新审查失败题，可在 `resume` 中加 `--refresh-reviews` 并限定 `--task-pattern`。程序将旧审核、裁决及补丁留痕归档到对应任务的 `artifacts/review-refresh/`，重新执行这些阶段；已校验的审题与规格检查点仍复用。默认续跑继续复用有效检查点；被结构或一致性校验拒绝的响应会归档到 `artifacts/rejected-resume/`，仅重新生成失败阶段，并携带具体诊断，不反复重用同一无效响应。候选规格及补丁应用结果先通过结构与一致性校验，再进入 Markdown 渲染，缺少必需字段会触发有限纠错，不会直接因渲染字段缺失中止。
 
 ```bash
 uv run rubric-generator resume \
