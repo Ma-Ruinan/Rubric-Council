@@ -502,6 +502,8 @@ class RubricRun:
 
     def _call_authoring_record(self, task_id: str, artifacts: Path, phase: str, prompt: str, title: str) -> dict[str, object]:
         checkpoint = artifacts / f"{phase}.validated.json"
+        if self.options.refresh_reviews and phase.startswith("author-revision-record-"):
+            self._archive_review_stage(task_id, artifacts, phase)
         cached = self._read_checkpoint(checkpoint, audit_authoring_record)
         if cached is not None:
             self._log(f"[{task_id}] {phase} 使用已校验检查点")
@@ -557,6 +559,7 @@ class RubricRun:
         result = self._call_validated_json_agent(
             task_id, artifacts, phase, "rubric-author", prompt, title,
             "BEGIN_RUBRIC_SPEC_JSON", "END_RUBRIC_SPEC_JSON", validate, "rubric spec",
+            inline_invalid=True,
         )
         if normalization_changes:
             self._write_json(
@@ -617,24 +620,25 @@ class RubricRun:
         end: str,
         validator: Callable[[dict[str, object]], list[str]],
         payload_name: str,
+        *,
+        inline_invalid: bool = False,
     ) -> dict[str, object]:
         checkpoint = artifacts / f"{phase}.validated.json"
-        if self.options.refresh_reviews and agent in {
+        review_dependent_author = agent == "rubric-author" and (
+            phase.startswith("author-revision-record-")
+            or (phase.startswith("author-spec-") and phase != "author-spec-00")
+        )
+        if self.options.refresh_reviews and (review_dependent_author or agent in {
             "rubric-reviewer", "rubric-review-classifier", "rubric-arbitrator", "rubric-finalizer",
-        }:
-            prior_files = [p for p in artifacts.iterdir() if p.is_file() and p.name.startswith(phase + ".")]
-            if prior_files:
-                history = artifacts / "review-refresh" / phase / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-                history.mkdir(parents=True, exist_ok=True)
-                for path in prior_files:
-                    path.replace(history / path.name)
-                self._log(f"[{task_id}] {phase} 保留旧留痕并刷新审核；审题和规格检查点不受影响")
+        }):
+            self._archive_review_stage(task_id, artifacts, phase)
         cached = self._read_checkpoint(checkpoint, validator)
         if cached is not None:
             self._log(f"[{task_id}] {phase} 使用已校验检查点")
             return cached
+        inline_invalid = inline_invalid or agent == "rubric-finalizer"
         prompt = self._refresh_rejected_stage(task_id, artifacts, phase, prompt, validator, payload_name,
-                                              inline_invalid=agent == "rubric-finalizer")
+                                              inline_invalid=inline_invalid)
         issues: list[str] = []
         for attempt in range(self.options.max_schema_retries + 1):
             suffix = "" if attempt == 0 else f".schema-retry-{attempt:02d}"
@@ -643,7 +647,7 @@ class RubricRun:
                 invalid = artifacts / f"{phase}.schema-invalid-{attempt - 1:02d}.json"
                 attempt_prompt += self._schema_correction_instruction(
                     invalid, issues, payload_name,
-                    inline_invalid=agent == "rubric-finalizer",
+                    inline_invalid=inline_invalid,
                 )
                 self._log(f"[{task_id}] {phase} 结构校验未通过，进行第 {attempt} 次纠错")
             payload = self._call_json_agent(
@@ -656,6 +660,16 @@ class RubricRun:
                 return payload
             self._write_json(artifacts / f"{phase}.schema-invalid-{attempt:02d}.json", payload)
         raise OpenCodeError(f"Invalid {payload_name} after bounded correction: " + "; ".join(issues))
+
+    def _archive_review_stage(self, task_id: str, artifacts: Path, phase: str) -> None:
+        """Archive one review-dependent stage before its checkpoint is read."""
+        prior_files = [p for p in artifacts.iterdir() if p.is_file() and p.name.startswith(phase + ".")]
+        if prior_files:
+            history = artifacts / "review-refresh" / phase / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            history.mkdir(parents=True, exist_ok=True)
+            for path in prior_files:
+                path.replace(history / path.name)
+            self._log(f"[{task_id}] {phase} 保留旧留痕并刷新审核及其下游；初始审题和规格检查点不受影响")
 
     def _refresh_rejected_stage(
         self, task_id: str, artifacts: Path, phase: str, prompt: str,

@@ -608,6 +608,32 @@ class FakeClient:
 
 
 class RunnerTests(unittest.TestCase):
+    def test_spec_correction_embeds_rejected_payload_without_requiring_forbidden_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); project = root / "project"; project.mkdir()
+            task = root / "dataset" / "task"; task.mkdir(parents=True)
+            (task / "问题描述.txt").write_text("提交一份结果", encoding="utf-8")
+            artifacts = project / "artifacts"; artifacts.mkdir()
+            valid = sample_spec()
+            invalid = json.loads(json.dumps(valid))
+            invalid["completion"]["atoms"][0]["requirement_or_anchor_ids"] = ["K01"]
+            prompts_seen = []
+            client = FakeClient(["BEGIN_RUBRIC_SPEC_JSON\n"+json.dumps(p)+"\nEND_RUBRIC_SPEC_JSON" for p in (invalid, valid)])
+            original_call = client.run_agent
+            def capture(agent, prompt, title):
+                prompts_seen.append(prompt)
+                return original_call(agent, prompt, title)
+            client.run_agent = capture
+            run = RubricRun(project, root / "dataset", RunOptions(retries=0), run_id="spec-inline")
+            run.client = client
+            result = run._call_rubric_spec("task", artifacts, "spec", "不要读取本地路径", "test", task, sample_record())
+            self.assertEqual(result, valid)
+            self.assertEqual(len(prompts_seen), 2)
+            self.assertIn('"requirement_or_anchor_ids":["K01"]', prompts_seen[1])
+            self.assertIn("无效版本如下（不得读取路径）", prompts_seen[1])
+            self.assertNotIn("读取无效版本后修正", prompts_seen[1])
+            self.assertTrue((artifacts / "spec.schema-invalid-00.json").exists())
+
     def test_resume_rejected_spec_refreshes_only_failed_stage_and_then_reuses_valid_checkpoint(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); project = root / "project"; project.mkdir()
@@ -668,6 +694,42 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(json.loads(archived[0].read_text())["summary"], "old")
             result = run._call_validated_json_agent("task", artifacts, "author", "rubric-author", "author", "test", "BEGIN_RECORD", "END_RECORD", lambda payload: [], "author")
             self.assertEqual(result, {"preserved": True})
+
+    def test_review_refresh_invalidates_downstream_author_revision_only(self):
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); project = root / "project"; project.mkdir()
+                artifacts = project / "artifacts"; artifacts.mkdir()
+                phases = ("author-analysis", "author-spec-00", "author-revision-record-01", "author-spec-01")
+                for phase in phases:
+                    (artifacts / f"{phase}.validated.json").write_text(json.dumps({"value": "old"}))
+                run = RubricRun(project, root / "dataset", RunOptions(resume=True, refresh_reviews=refresh, retries=0), run_id="dependency-test")
+                run.client = FakeClient(["BEGIN_RECORD\n{\"value\":\"fresh\"}\nEND_RECORD"] * 2)
+                for phase in phases:
+                    result = run._call_validated_json_agent("task", artifacts, phase, "rubric-author", "new blocking feedback", "test", "BEGIN_RECORD", "END_RECORD", lambda payload: [], "record")
+                    expected = "fresh" if refresh and phase in phases[2:] else "old"
+                    self.assertEqual(result["value"], expected)
+                archives = list((artifacts / "review-refresh").rglob("*.validated.json"))
+                self.assertEqual(len(archives), 2 if refresh else 0)
+
+    def test_review_refresh_reaches_real_authoring_record_cache(self):
+        for refresh in (False, True):
+            with self.subTest(refresh=refresh), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); project = root / "project"; project.mkdir()
+                artifacts = project / "artifacts"; artifacts.mkdir()
+                old = sample_record()
+                fresh = deepcopy(old)
+                fresh["evidence_boundary"]["cutoff_or_version"] = "bind participant execution date"
+                phase = "author-revision-record-01"
+                (artifacts / f"{phase}.validated.json").write_text(json.dumps(old))
+                (artifacts / "author-analysis.validated.json").write_text(json.dumps(old))
+                run = RubricRun(project, root / "dataset", RunOptions(resume=True, refresh_reviews=refresh, retries=0), run_id="record-refresh-test")
+                run.client = FakeClient(["BEGIN_AUTHORING_RECORD_JSON\n"+json.dumps(fresh)+"\nEND_AUTHORING_RECORD_JSON"])
+                result = run._call_authoring_record("task", artifacts, phase, "new blocking", "test")
+                self.assertEqual(result, fresh if refresh else old)
+                self.assertEqual(run._call_authoring_record("task", artifacts, "author-analysis", "initial", "test"), old)
+                archived = list((artifacts / "review-refresh").rglob(f"{phase}.validated.json"))
+                self.assertEqual(len(archived), int(refresh))
 
     def test_default_allows_only_one_reviewer_directed_revision(self):
         self.assertEqual(RunOptions().max_revision_rounds, 1)

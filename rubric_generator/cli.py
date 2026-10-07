@@ -40,7 +40,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--missing-only", action="store_true", help="只处理尚无 rubric.md 的题目")
     resume.add_argument("--limit", type=int)
     resume.add_argument("--timeout", type=int, default=900)
-    resume.add_argument("--refresh-reviews", action="store_true", help="保留旧审核留痕并重新审核，复用审题与规格检查点")
+    resume.add_argument("--refresh-reviews", action="store_true", help="归档并刷新审核及其下游修改，复用初始审题与规格检查点")
 
     regression = sub.add_parser("regression", help="复制只读参考数据集并运行隔离回归")
     regression.add_argument("--source", type=Path, required=True)

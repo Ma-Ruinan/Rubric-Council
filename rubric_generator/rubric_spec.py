@@ -280,7 +280,13 @@ def audit_rubric_spec(spec: dict[str, Any], task_dir: Path | None = None) -> lis
                 source_urls.add(normalized_url)
                 status = source.get("verification_status")
                 if status not in SOURCE_VERIFICATION_STATUSES:
-                    issues.append(f"live source {source_id or index} has unsupported verification_status")
+                    issues.append(
+                        f"live source {source_id or index} has unsupported verification_status {status!r}; "
+                        "expected verified, access_restricted, or temporarily_unavailable. "
+                        "If an attempted request failed and no page content was obtained, use "
+                        "temporarily_unavailable with the actual failure evidence and fallback_note; "
+                        "do not claim the source was verified."
+                    )
                 fallback_url = source.get("fallback_url")
                 fallback_note = source.get("fallback_note")
                 if not isinstance(fallback_url, str) or not isinstance(fallback_note, str):
