@@ -31,6 +31,7 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--missing-only", action="store_true", help="只处理尚无 rubric.md 的题目")
     generate.add_argument("--limit", type=int)
     generate.add_argument("--timeout", type=int, default=900)
+    generate.add_argument("--execution-contract", action="store_true", help="要求可校验的取证、缺陷主责和封顶边界扩展；兼容旧规格")
 
     resume = sub.add_parser("resume", help="从已有运行的已校验检查点继续")
     resume.add_argument("--dataset", type=Path, required=True)
@@ -40,6 +41,7 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--missing-only", action="store_true", help="只处理尚无 rubric.md 的题目")
     resume.add_argument("--limit", type=int)
     resume.add_argument("--timeout", type=int, default=900)
+    resume.add_argument("--execution-contract", action="store_true")
     resume.add_argument("--refresh-reviews", action="store_true", help="归档并刷新审核及其下游修改，复用初始审题与规格检查点")
 
     regression = sub.add_parser("regression", help="复制只读参考数据集并运行隔离回归")
@@ -92,6 +94,7 @@ def main(argv: list[str] | None = None) -> int:
             timeout_seconds=args.timeout,
             resume=is_resume,
             refresh_reviews=getattr(args, "refresh_reviews", False),
+            enforce_execution_contract=getattr(args, "execution_contract", False),
         ), run_id=args.run_id if is_resume else None)
         try:
             outcomes = run.execute(tasks)

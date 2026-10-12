@@ -24,6 +24,7 @@ from rubric_generator.rubric_spec import (
     METRICS,
     audit_authoring_record_spec_alignment,
     audit_rubric_spec,
+    audit_execution_contract,
     normalize_rubric_spec,
     render_rubric,
 )
@@ -131,6 +132,40 @@ def sample_spec() -> dict[str, object]:
 
 
 class RubricSpecTests(unittest.TestCase):
+    def test_execution_contract_is_optional_for_old_specs_and_required_on_request(self):
+        spec = sample_spec()
+        self.assertEqual(audit_execution_contract(spec), [])
+        self.assertTrue(audit_execution_contract(spec, required=True))
+
+    def test_execution_contract_validates_owners_and_renders_portably(self):
+        spec = sample_spec()
+        spec['execution_contract'] = {
+            'delivery_policy':'等价格式共同提供定位证据，遵守题面主报告要求。',
+            'item_policy':'每个计分元素有核验定位；空字段不算有效值。',
+            'ownership_note':'事实与矛盾按具体缺陷归属；不以同一事实重复扣分。',
+            'ownership_rules':[{'metric':'hallucination_consistency','defect':'被证伪的事实主张',
+                                'primary_atom':'H01','related_atoms':[],'exclusion':'保留独立缺陷，不重复计罚。'}],
+            'cap_boundaries':[]}
+        self.assertEqual(audit_rubric_spec(spec), [])
+        self.assertIn('主责 H01',render_rubric(spec))
+        spec['execution_contract']['ownership_rules'][0]['related_atoms']=['A01']
+        self.assertEqual(audit_execution_contract(spec), [])
+        invalid_related = deepcopy(spec)
+        invalid_related['execution_contract']['ownership_rules'][0]['related_atoms']=['UNKNOWN']
+        self.assertTrue(audit_execution_contract(invalid_related))
+        bad = deepcopy(spec)
+        bad['execution_contract']['ownership_rules'][0]['primary_atom']='A01'
+        self.assertTrue(audit_execution_contract(bad))
+        bad = deepcopy(spec)
+        bad['execution_contract']['ownership_rules'].append(deepcopy(bad['execution_contract']['ownership_rules'][0]))
+        self.assertTrue(any('one owner' in s for s in audit_execution_contract(bad)))
+
+    def test_execution_contract_caps_cannot_omit_or_invent_error_ids(self):
+        spec = sample_spec()
+        spec['execution_contract'] = {'delivery_policy':'按题面','item_policy':'逐条', 'ownership_note':'没有重叠',
+            'ownership_rules':[], 'cap_boundaries':[{'error_id':'E99','required_conditions':['真实要件'], 'excluded_cases':['普通缺项']}]}
+        self.assertTrue(any('every error ID' in s for s in audit_execution_contract(spec)))
+
     def test_valid_spec_renders_fixed_reporting_contract(self):
         with tempfile.TemporaryDirectory() as tmp:
             task = Path(tmp)
@@ -694,6 +729,25 @@ class RunnerTests(unittest.TestCase):
             self.assertEqual(json.loads(archived[0].read_text())["summary"], "old")
             result = run._call_validated_json_agent("task", artifacts, "author", "rubric-author", "author", "test", "BEGIN_RECORD", "END_RECORD", lambda payload: [], "author")
             self.assertEqual(result, {"preserved": True})
+
+    def test_review_input_binding_invalidates_changed_specs_but_preserves_resume(self):
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory)
+            artifacts = project / 'artifacts'; artifacts.mkdir()
+            run = RubricRun(project, project / 'dataset', RunOptions(resume=True), run_id='binding-test')
+            initial = artifacts / 'author-spec-00.validated.json'
+            initial.write_text('{}', encoding='utf-8')
+            review = artifacts / 'review-01.validated.json'
+            review.write_text('{"old":true}', encoding='utf-8')
+            run._bind_review_input('task', artifacts, {}, {'revision':1})
+            self.assertFalse(review.exists())
+            self.assertTrue(initial.exists())
+            review.write_text('{"current":true}', encoding='utf-8')
+            run._bind_review_input('task', artifacts, {}, {'revision':1})
+            self.assertTrue(review.exists())
+            run._bind_review_input('task', artifacts, {}, {'revision':2})
+            self.assertFalse(review.exists())
+            self.assertEqual(len(list((artifacts/'review-refresh').rglob('review-01.validated.json'))), 2)
 
     def test_review_refresh_invalidates_downstream_author_revision_only(self):
         for refresh in (False, True):

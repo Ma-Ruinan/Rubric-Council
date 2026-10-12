@@ -109,6 +109,14 @@ def rubric_spec_schema_example() -> dict[str, Any]:
             "effects": [{"metric": "accuracy_fidelity", "cap": 2.0, "atom_ids": []}],
         }],
         "evidence_record_requirements": [],
+        "execution_contract": {
+            "delivery_policy": "按题面说明主报告、附件和等价版本的证据使用方式",
+            "item_policy": "按每项规则确定全集/抽样和逐项核验，空字段不算有效值",
+            "ownership_note": "说明哪些细项可能重叠及归属依据；没有重叠时解释原因",
+            "ownership_rules": [{"metric": "hallucination_consistency", "defect": "本题可能重叠的具体缺陷类别",
+                                 "primary_atom": "H01", "related_atoms": [], "exclusion": "说明相关细项如何排除同一缺陷；保留独立缺陷"}],
+            "cap_boundaries": [{"error_id": "E01", "required_conditions": ["全部触发要件"], "excluded_cases": ["适用排除情形"]}],
+        },
         "unresolved_input_gaps": [],
     }
 
@@ -441,6 +449,60 @@ def audit_rubric_spec(spec: dict[str, Any], task_dir: Path | None = None) -> lis
     for token in FORBIDDEN_PORTABLE_TOKENS:
         if token.casefold() in portable_text.casefold():
             issues.append(f"rubric spec leaks internal build reference: {token}")
+    issues.extend(audit_execution_contract(spec))
+    return _dedupe(issues)
+
+
+def audit_execution_contract(spec: dict, *, required: bool = False) -> list[str]:
+    """Optional extension: old specs remain valid; new runs can require it."""
+    contract = spec.get("execution_contract")
+    if contract is None:
+        return ["execution_contract is required for this run; define delivery/item policy, explicit ownership and cap boundaries"] if required else []
+    if not isinstance(contract, dict):
+        return ["execution_contract must be an object"]
+    issues = []
+    for key in ("delivery_policy", "item_policy", "ownership_note"):
+        if not isinstance(contract.get(key), str) or not contract[key].strip():
+            issues.append(f"execution_contract.{key} must explain the applicable boundary")
+    atom_map = {str(a.get("id")): metric for metric,a in iter_spec_atoms(spec) if isinstance(a, dict)}
+    rules = contract.get("ownership_rules")
+    if not isinstance(rules, list):
+        issues.append("execution_contract.ownership_rules must be a list")
+    else:
+        seen = set()
+        for rule_index, rule in enumerate(rules, 1):
+            if not isinstance(rule, dict):
+                issues.append("ownership rule must be an object"); continue
+            metric, primary = rule.get("metric"), rule.get("primary_atom")
+            if not isinstance(primary,str) or not isinstance(metric,str) or atom_map.get(primary) != metric or metric not in METRIC_KEYS:
+                issues.append(f"ownership rule {rule_index}: primary_atom {primary!r} belongs to {atom_map.get(str(primary))!r}, not declared metric {metric!r}; choose an existing atom in that metric or split distinct consequences into separate rules")
+            related = rule.get("related_atoms")
+            if not isinstance(related,list) or any(not isinstance(a,str) or a==primary or a not in atom_map for a in related):
+                issues.append(f"ownership rule {rule_index}: related_atoms must identify other existing atoms; cross-metric context is allowed, but primary_atom must belong to the declared metric")
+            for key in ("defect", "exclusion"):
+                if not isinstance(rule.get(key),str) or not rule[key].strip():
+                    issues.append(f"ownership rule needs explicit {key}")
+            key = (str(metric),str(rule.get("defect")))
+            if key in seen: issues.append("one defect class must have one owner per metric")
+            seen.add(key)
+    cap_rules = contract.get("cap_boundaries")
+    error_ids = {e.get("id") for e in spec.get("error_rules",[]) if isinstance(e,dict)}
+    if not isinstance(cap_rules,list):
+        issues.append("execution_contract.cap_boundaries must be a list")
+    else:
+        ids = []
+        for cap in cap_rules:
+            if not isinstance(cap,dict):issues.append("cap boundary must be an object");continue
+            if isinstance(cap.get("error_id"),str):
+                ids.append(cap["error_id"])
+            else:
+                issues.append("cap boundary error_id must be a string")
+            for key in ("required_conditions","excluded_cases"):
+                values = cap.get(key)
+                if not isinstance(values,list) or not values or any(not isinstance(v,str) or not v.strip() for v in values):
+                    issues.append(f"cap boundary needs nonempty {key}")
+        if set(ids)!=error_ids or len(ids)!=len(set(ids)):
+            issues.append("cap_boundaries must cover every error ID exactly once")
     return _dedupe(issues)
 
 
@@ -618,6 +680,10 @@ def render_rubric(spec: dict[str, Any]) -> str:
         "## 9. 证据记录与计算规则",
         "",
         "- 每个原子必须记录：状态、权重、得分贡献、交付文件名、可定位证据和判分原因。",
+        "- 对缺失结论说明检查过的文件和范围；文本提取未呈现不等于原文件没有。按题面的主报告/附件规则检查相关交付，链接属性、PDF链接注释及结构化引用数据可作为定位证据；若题面明确要求正文可见披露，另按该要求判定。",
+        "- 字段存在但值为空不算要素齐备。逐项比例须记录每个计分元素的结果与定位；允许有明确集合或范围及可复算计数的分组，不得由少数样例或统一模板推断其余全部通过。",
+        "- 记录具体缺陷及其原文、位置、期间和口径，明确同指标内主责原子与其他关联原子的处理；不能一项确认缺陷、另一项又无解释地声称不存在。跨指标计罚须说明不同可观察后果。",
+        "- 内部一致性同时检查数值和关系/结论，区别合法舍入、已说明的口径差异与实质矛盾；严重错误须逐项满足本题触发要件，不能把普通缺项直接升级为封顶。",
         "- `BIN` 取 0 或 1；`RATIO`、`COUNT`、`CLAIM-RATIO` 按原子状态规则折算至 0—1。",
         "- 找不到证据记为未满足；不得以整体印象补分。所有乘法、求和、平均和上限应用应由计算工具执行。",
     ])
@@ -627,6 +693,16 @@ def render_rubric(spec: dict[str, Any]) -> str:
             "应优先查归档、同时间接证据或同期权威来源，并记录无法复核的限制。"
         )
     lines.extend(_bullets(spec.get("evidence_record_requirements"), "无额外证据记录要求。"))
+    contract = spec.get("execution_contract")
+    if isinstance(contract, dict):
+        lines.extend(["", "### 9.1 取证与缺陷归属合同", "",
+                      "- " + contract["delivery_policy"], "- " + contract["item_policy"],
+                      "- " + contract["ownership_note"]])
+        for rule in contract["ownership_rules"]:
+            related = "、".join(rule["related_atoms"]) or "无其他关联原子"
+            lines.append(f"- {_metric_label(rule['metric'])}：{rule['defect']}；主责 {rule['primary_atom']}；关联 {related}；{rule['exclusion']}")
+        for cap in contract["cap_boundaries"]:
+            lines.append(f"- {cap['error_id']} 必须同时满足：{'；'.join(cap['required_conditions'])}。排除：{'；'.join(cap['excluded_cases'])}。")
     lines.extend([
         "- 单题质量均分为五项质量分的算术平均值；任务完成率单独展示，不并入质量均分。",
         "",
@@ -677,6 +753,8 @@ def semantic_fingerprint(record: dict[str, Any], spec: dict[str, Any]) -> dict[s
         "atoms": atoms,
         "error_rules": spec.get("error_rules", []),
     }
+    if "execution_contract" in spec:
+        payload["execution_contract"] = spec["execution_contract"]
     canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return {"sha256": hashlib.sha256(canonical.encode("utf-8")).hexdigest(), "components": payload}
 

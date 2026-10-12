@@ -23,3 +23,5 @@ DeepInsight测试数据集/
 *.bak
 常规能力测试数据集/
 AlphaData测试数据集/
+
+/DeepInsight测试数据集_*/

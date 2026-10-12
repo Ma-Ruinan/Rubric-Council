@@ -30,6 +30,7 @@ from .opencode_client import OpenCodeClient, OpenCodeError, extract_json
 from .rubric_spec import (
     audit_authoring_record_spec_alignment,
     audit_rubric_spec,
+    audit_execution_contract,
     audit_rendered_rubric,
     normalize_rubric_spec,
     render_rubric,
@@ -58,6 +59,7 @@ class RunOptions:
     retries: int = 1
     resume: bool = False
     refresh_reviews: bool = False
+    enforce_execution_contract: bool = False
 
 
 @dataclass
@@ -216,6 +218,9 @@ class RubricRun:
             current_rubric = artifacts / "rubric-00.md"
             self._write_text(current_rubric, render_rubric(rubric_spec))
             spec_history = [current_spec]
+
+            if self.options.enforce_execution_contract:
+                self._bind_review_input(task.task_id, artifacts, authoring_record, rubric_spec)
 
             review_files: list[Path] = []
             previous_review: Path | None = None
@@ -548,6 +553,7 @@ class RubricRun:
             issues = [
                 *audit_rubric_spec(spec, task_dir),
                 *audit_authoring_record_spec_alignment(record, spec),
+                *audit_execution_contract(spec, required=self.options.enforce_execution_contract),
             ]
             if issues:
                 return issues
@@ -595,6 +601,7 @@ class RubricRun:
                 *audit_authoring_record(record),
                 *audit_rubric_spec(spec, task_dir),
                 *audit_authoring_record_spec_alignment(record, spec),
+                *audit_execution_contract(spec, required=self.options.enforce_execution_contract),
             ]
             if issues:
                 return issues
@@ -660,6 +667,37 @@ class RubricRun:
                 return payload
             self._write_json(artifacts / f"{phase}.schema-invalid-{attempt:02d}.json", payload)
         raise OpenCodeError(f"Invalid {payload_name} after bounded correction: " + "; ".join(issues))
+
+    def _bind_review_input(self, task_id: str, artifacts: Path, record: dict, spec: dict) -> None:
+        """Never reuse approvals for a different initial spec or review policy."""
+        policies = {p.name: p.read_text(encoding="utf-8")
+                    for p in (self.project_dir / ".opencode" / "agents").glob("rubric-*.md")}
+        digest = hashlib.sha256(json.dumps({"record": record, "spec": spec,
+            "contract": prompts.REPORTING_CONTRACT, "agents": policies},
+            ensure_ascii=False, sort_keys=True).encode()).hexdigest()
+        binding = artifacts / "review-input-binding.json"
+        try:
+            previous = json.loads(binding.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            previous = {}
+        if previous.get("sha256") == digest:
+            return
+        dependent = []
+        for path in artifacts.iterdir():
+            name = path.name
+            if not path.is_file():
+                continue
+            if (name.startswith(("review-", "final-", "arbitration", "author-revision-", "author-final-"))
+                or (name.startswith(("author-spec-", "authoring-record-", "rubric-spec-", "rubric-"))
+                    and not name.startswith(("author-spec-00", "authoring-record-00", "rubric-spec-00", "rubric-00")))):
+                dependent.append(path)
+        if dependent:
+            history = artifacts / "review-refresh" / "input-change" / datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+            history.mkdir(parents=True, exist_ok=True)
+            for path in dependent:
+                path.replace(history / path.name)
+            self._log(f"[{task_id}] 审核输入变化或未绑定：保留旧审核并重新核验当前规格")
+        self._write_json(binding, {"sha256": digest, "version": 1})
 
     def _archive_review_stage(self, task_id: str, artifacts: Path, phase: str) -> None:
         """Archive one review-dependent stage before its checkpoint is read."""
