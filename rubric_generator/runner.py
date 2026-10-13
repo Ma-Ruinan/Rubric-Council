@@ -60,6 +60,7 @@ class RunOptions:
     resume: bool = False
     refresh_reviews: bool = False
     enforce_execution_contract: bool = False
+    temperature: float | None = None
 
 
 @dataclass
@@ -96,6 +97,7 @@ class RubricRun:
             options.retries,
             logger=self._log,
             model_by_agent=settings.agent_models,
+            **({"temperature": options.temperature} if options.temperature is not None else {}),
         )
 
     def execute(self, tasks: list[DatasetTask] | None = None) -> list[TaskOutcome]:
@@ -441,6 +443,7 @@ class RubricRun:
             # failed attempt.  Once delivery succeeds, status.json must describe
             # the current terminal state rather than retain a stale failure.
             state.pop("error", None)
+            state.pop("error_type", None)
             state.pop("audit_issues", None)
             state.update({
                 "status": final_status,
@@ -458,7 +461,7 @@ class RubricRun:
             return TaskOutcome(task.task_id, str(task.relative_dir), final_status, str(output), revision_rounds, [])
         except Exception as exc:
             status = "INPUT_BLOCKED" if isinstance(exc, (OSError, UnicodeError)) else "FAILED"
-            state.update({"status": status, "completed_at": _now(), "error": str(exc)})
+            state.update({"status": status, "completed_at": _now(), "error": str(exc), "error_type": type(exc).__name__})
             self._write_json(task_run / "status.json", state)
             self._log(f"[{task.task_id}] 失败：{status}；{exc}")
             return TaskOutcome(
@@ -673,7 +676,8 @@ class RubricRun:
         policies = {p.name: p.read_text(encoding="utf-8")
                     for p in (self.project_dir / ".opencode" / "agents").glob("rubric-*.md")}
         digest = hashlib.sha256(json.dumps({"record": record, "spec": spec,
-            "contract": prompts.REPORTING_CONTRACT, "agents": policies},
+            "contract": prompts.REPORTING_CONTRACT, "agents": policies,
+            **({"temperature": self.options.temperature} if self.options.temperature is not None else {})},
             ensure_ascii=False, sort_keys=True).encode()).hexdigest()
         binding = artifacts / "review-input-binding.json"
         try:

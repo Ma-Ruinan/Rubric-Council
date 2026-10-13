@@ -33,6 +33,7 @@ class OpenCodeClient:
         retries: int = 2,
         logger: Callable[[str], None] | None = None,
         model_by_agent: dict[str, str] | None = None,
+        temperature: float | None = None,
     ):
         self.project_dir = project_dir.resolve()
         self.timeout_seconds = timeout_seconds
@@ -45,6 +46,15 @@ class OpenCodeClient:
         if self.run_mode not in {"standalone", "legacy"}:
             raise OpenCodeError("OPENCODE_RUN_MODE must be standalone or legacy")
         self.process_env = os.environ.copy()
+        if temperature is not None:
+            import math
+            if not math.isfinite(temperature) or not 0 <= temperature <= 2:
+                raise ValueError("temperature must be finite and between 0 and 2")
+            overrides = json.loads(self.process_env.get("OPENCODE_CONFIG_CONTENT", "{}"))
+            agents = overrides.setdefault("agent", {})
+            for role in self.model_by_agent:
+                agents.setdefault(role, {})["temperature"] = temperature
+            self.process_env["OPENCODE_CONFIG_CONTENT"] = json.dumps(overrides)
         if self.run_mode == "legacy":
             # CLI versions have incompatible databases. Never let a legacy
             # child migrate or overwrite the user's existing OpenCode state.
@@ -122,7 +132,7 @@ class OpenCodeClient:
                     continue
                 if response.terminal_error and not _has_complete_marked_payload(response.text):
                     raise OpenCodeError(
-                        f"OpenCode agent {agent} provider failed before complete output: "
+                        f"OpenCode agent {agent} 在返回完整结果前接口失败： "
                         f"{response.terminal_error}"
                     )
                 if completed.returncode != 0:
@@ -134,7 +144,7 @@ class OpenCodeClient:
                     # Permission/configuration failures are deterministic. Retrying
                     # them only multiplies latency and API usage.
                     lowered = detail.casefold()
-                    if "permission requested" in lowered or "user dismissed" in lowered:
+                    if any(term in lowered for term in ("permission requested", "user dismissed", "endpoint_migrated", "地址已迁移")):
                         raise error
                     # Some gateways/CLI adapters return a non-zero exit code
                     # after the model has already emitted a complete answer.
@@ -149,7 +159,7 @@ class OpenCodeClient:
                     else:
                         raise error
                 if not response.text.strip():
-                    raise OpenCodeError(f"OpenCode agent {agent} returned no text")
+                    raise OpenCodeError(f"OpenCode agent {agent} 未返回文本")
                 self._log(
                     f"{agent} 已返回（{title}），耗时 {time.monotonic() - started:.1f} 秒"
                 )
@@ -165,7 +175,7 @@ class OpenCodeClient:
                     if _has_complete_marked_payload(partial.text):
                         self._log(f"{agent} 超时前已返回完整标记内容，继续由调用方校验")
                         return partial
-                    last_error = OpenCodeError(f"OpenCode agent {agent} timed out after {self.timeout_seconds}s; partial events saved")
+                    last_error = OpenCodeError(f"OpenCode agent {agent} 超过{self.timeout_seconds}秒未完成，部分事件已保存")
                     if partial.session_ids and attempt < self.retries:
                         if "--session" not in command:
                             # Options must precede --, which terminates option parsing.
@@ -177,7 +187,7 @@ class OpenCodeClient:
                         self._log(f"{agent} 将在已有会话继续；不丢弃已完成的工具核验")
                 if isinstance(exc, OpenCodeError):
                     lowered = str(exc).casefold()
-                    if "permission requested" in lowered or "user dismissed" in lowered:
+                    if any(term in lowered for term in ("permission requested", "user dismissed", "endpoint_migrated", "地址已迁移")):
                         break
                 if attempt >= self.retries:
                     break
@@ -209,6 +219,9 @@ class OpenCodeClient:
             )
 
     def _log(self, message: str) -> None:
+        labels = {"rubric-runtime-probe": "工具兼容性检查", "rubric-author": "规则制作", "rubric-reviewer": "独立审核", "rubric-review-classifier": "审核建议分类", "rubric-arbitrator": "分歧裁决", "rubric-finalizer": "最终修订", "rubric-json-repair": "输出格式修复", "rubric-orchestrator": "流程编排", "runtime tool roundtrip probe": "工具读取及续写检查"}
+        for name, label in labels.items():
+            message = message.replace(name, label)
         if self.logger is not None:
             self.logger(message)
 

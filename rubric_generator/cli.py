@@ -28,21 +28,37 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--concurrency", type=int, default=3, choices=(1, 2, 3))
     generate.add_argument("--force", action="store_true")
     generate.add_argument("--task-pattern")
+    generate.add_argument("--task-id", action="append")
     generate.add_argument("--missing-only", action="store_true", help="只处理尚无 rubric.md 的题目")
     generate.add_argument("--limit", type=int)
     generate.add_argument("--timeout", type=int, default=900)
     generate.add_argument("--execution-contract", action="store_true", help="要求可校验的取证、缺陷主责和封顶边界扩展；兼容旧规格")
+    generate.add_argument("--run-id")
+    generate.add_argument("--temperature", type=float)
 
     resume = sub.add_parser("resume", help="从已有运行的已校验检查点继续")
     resume.add_argument("--dataset", type=Path, required=True)
     resume.add_argument("--run-id", required=True)
     resume.add_argument("--concurrency", type=int, default=1, choices=(1, 2, 3))
     resume.add_argument("--task-pattern")
+    resume.add_argument("--task-id", action="append")
     resume.add_argument("--missing-only", action="store_true", help="只处理尚无 rubric.md 的题目")
     resume.add_argument("--limit", type=int)
     resume.add_argument("--timeout", type=int, default=900)
     resume.add_argument("--execution-contract", action="store_true")
     resume.add_argument("--refresh-reviews", action="store_true", help="归档并刷新审核及其下游修改，复用初始审题与规格检查点")
+    resume.add_argument("--temperature", type=float)
+
+    automatic = sub.add_parser("run", help="自主生成、校验与恢复；失败任务有界重试，保留有效成果")
+    automatic.add_argument("--dataset", type=Path, required=True)
+    automatic.add_argument("--run-id", required=True)
+    automatic.add_argument("--concurrency", type=int, default=3, choices=(1, 2, 3))
+    automatic.add_argument("--timeout", type=int, default=1800)
+    automatic.add_argument("--temperature", type=float)
+    automatic.add_argument("--execution-contract", action="store_true")
+    automatic.add_argument("--max-attempts", type=int, default=8)
+    automatic.add_argument("--max-stalled-attempts", type=int, default=3)
+    automatic.add_argument("--retry-delay", type=float, default=30)
 
     regression = sub.add_parser("regression", help="复制只读参考数据集并运行隔离回归")
     regression.add_argument("--source", type=Path, required=True)
@@ -54,8 +70,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="backslashreplace")
     args = build_parser().parse_args(argv)
     project = args.project_dir.resolve()
+
+    if args.command == "run":
+        from .supervisor import supervise
+        return supervise(project, args)
 
     if args.command == "audit":
         results = audit_dataset(args.dataset)
@@ -80,6 +103,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command in {"generate", "resume"}:
         tasks = discover_tasks(args.dataset)
+        if args.task_id:
+            tasks = [task for task in tasks if task.task_id in args.task_id]
         if args.task_pattern:
             needle = args.task_pattern.casefold()
             tasks = [task for task in tasks if needle in str(task.relative_dir).casefold()]
@@ -95,7 +120,8 @@ def main(argv: list[str] | None = None) -> int:
             resume=is_resume,
             refresh_reviews=getattr(args, "refresh_reviews", False),
             enforce_execution_contract=getattr(args, "execution_contract", False),
-        ), run_id=args.run_id if is_resume else None)
+            temperature=args.temperature,
+        ), run_id=args.run_id)
         try:
             outcomes = run.execute(tasks)
         except RuntimeError as exc:
