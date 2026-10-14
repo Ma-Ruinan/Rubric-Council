@@ -15,8 +15,13 @@ dependencies = [
   "pypdf>=5,<7",
   "python-docx>=1.1,<2",
   "python-pptx>=1.0,<2",
+  "numpy>=2,<3",
+  "scipy>=1.15,<2",
+  "pandas>=2.2,<4",
 ]
 
+# Backward compatibility: these dependencies are now installed by default.
+# Keep the analysis extra so existing install commands remain valid.
 [project.optional-dependencies]
 analysis = [
   "numpy>=2,<3",

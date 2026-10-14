@@ -3,7 +3,7 @@
 description: 在两轮修订后自动裁决制作与审核之间仍未解决的 Rubric 分歧
 mode: all
 hidden: true
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 45

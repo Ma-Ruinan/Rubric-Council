@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-DEFAULT_MODEL = "aiaaa/deepseek-v4.1-flash#high"
+DEFAULT_MODEL = "custom/deepseek-v4.1-flash#high"
 AGENT_ROLES = (
     "rubric-author",
     "rubric-finalizer",
@@ -35,7 +35,7 @@ def load_project_env(project_dir: Path) -> tuple[str, ...]:
     """
     path = project_dir.resolve() / ".env"
     if not path.is_file():
-        return ()
+        return _api_key_aliases()
     loaded: list[str] = []
     for line_number, raw_line in enumerate(path.read_text(encoding="utf-8-sig").splitlines(), 1):
         line = raw_line.strip()
@@ -53,7 +53,18 @@ def load_project_env(project_dir: Path) -> tuple[str, ...]:
         if key not in os.environ:
             os.environ[key] = value
             loaded.append(key)
-    return tuple(loaded)
+    return tuple(loaded) + _api_key_aliases()
+
+
+def _api_key_aliases() -> tuple[str, ...]:
+    """Bridge new and legacy key names without replacing explicit values."""
+    if "API_KEY" not in os.environ and "AIAAA_API_KEY" in os.environ:
+        os.environ["API_KEY"] = os.environ["AIAAA_API_KEY"]
+        return ("API_KEY",)
+    if "AIAAA_API_KEY" not in os.environ and "API_KEY" in os.environ:
+        os.environ["AIAAA_API_KEY"] = os.environ["API_KEY"]
+        return ("AIAAA_API_KEY",)
+    return ()
 
 
 def load_project_settings(project_dir: Path) -> ProjectSettings:

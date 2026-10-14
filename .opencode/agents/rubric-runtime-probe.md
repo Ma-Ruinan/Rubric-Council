@@ -2,7 +2,7 @@
 description: 在批量任务前验证模型网关是否支持一次完整的工具调用续写
 mode: all
 hidden: true
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 3

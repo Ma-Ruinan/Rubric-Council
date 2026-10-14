@@ -2,7 +2,7 @@
 description: 修复已有完整标记响应中的局部 JSON 语法损坏，不改变内容语义
 mode: all
 hidden: true
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 4

@@ -324,10 +324,15 @@ name = "opencode-rubric-generator"
 version = "1.0.0"
 source = { editable = "." }
 dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "openpyxl" },
+    { name = "pandas" },
     { name = "pypdf" },
     { name = "python-docx" },
     { name = "python-pptx" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.optional-dependencies]
@@ -341,12 +346,15 @@ analysis = [
 
 [package.metadata]
 requires-dist = [
+    { name = "numpy", specifier = ">=2,<3" },
     { name = "numpy", marker = "extra == 'analysis'", specifier = ">=2,<3" },
     { name = "openpyxl", specifier = ">=3.1,<4" },
+    { name = "pandas", specifier = ">=2.2,<4" },
     { name = "pandas", marker = "extra == 'analysis'", specifier = ">=2.2,<4" },
     { name = "pypdf", specifier = ">=5,<7" },
     { name = "python-docx", specifier = ">=1.1,<2" },
     { name = "python-pptx", specifier = ">=1.0,<2" },
+    { name = "scipy", specifier = ">=1.15,<2" },
     { name = "scipy", marker = "extra == 'analysis'", specifier = ">=1.15,<2" },
 ]
 provides-extras = ["analysis"]

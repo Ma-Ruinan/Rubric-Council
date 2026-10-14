@@ -1,7 +1,7 @@
 ---
 description: Rubric Generator 的交互入口，负责解释流程并调用专业 Subagent，不直接编写或审核 Rubric
 mode: primary
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 30

@@ -437,6 +437,42 @@ class ConfigurationTests(unittest.TestCase):
             self.assertEqual(settings.agent_models["rubric-finalizer"], DEFAULT_MODEL)
             self.assertEqual(settings.agent_models["rubric-runtime-probe"], DEFAULT_MODEL)
 
+    def test_api_key_aliases_from_file_support_both_names(self):
+        for source, target in (("API_KEY", "AIAAA_API_KEY"), ("AIAAA_API_KEY", "API_KEY")):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                (root / ".env").write_text(f"{source}=test-key\n", encoding="utf-8")
+                with patch.dict(os.environ, {}, clear=True):
+                    loaded = load_project_env(root)
+                    self.assertEqual(os.environ[source], "test-key")
+                    self.assertEqual(os.environ[target], "test-key")
+                    self.assertIn(source, loaded)
+                    self.assertIn(target, loaded)
+
+    def test_api_key_aliases_work_without_env_file(self):
+        for source, target in (("API_KEY", "AIAAA_API_KEY"), ("AIAAA_API_KEY", "API_KEY")):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as tmp:
+                with patch.dict(os.environ, {source: "process-key"}, clear=True):
+                    self.assertEqual(load_project_env(Path(tmp)), (target,))
+                    self.assertEqual(os.environ[target], "process-key")
+
+    def test_api_key_aliases_preserve_explicit_distinct_values(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".env").write_text("API_KEY=file-new\nAIAAA_API_KEY=file-old\n", encoding="utf-8")
+            with patch.dict(os.environ, {"API_KEY": "process-new", "AIAAA_API_KEY": "process-old"}, clear=True):
+                self.assertEqual(load_project_env(root), ())
+                self.assertEqual(os.environ["API_KEY"], "process-new")
+                self.assertEqual(os.environ["AIAAA_API_KEY"], "process-old")
+
+    def test_custom_model_id_can_contain_a_slash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "rubric-generator.toml").write_text(
+                '[agents.rubric-reviewer]\nmodel = "custom/z.ai/glm5-3"\n', encoding="utf-8"
+            )
+            self.assertEqual(load_project_settings(root).model_for("rubric-reviewer"), "custom/z.ai/glm5-3")
+
     def test_project_env_loads_without_overwriting_process_values(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

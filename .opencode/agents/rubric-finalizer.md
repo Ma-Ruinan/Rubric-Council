@@ -2,7 +2,7 @@
 description: 根据已校验产物和绑定裁决生成最小、可验证的最终 JSON Patch
 mode: all
 hidden: true
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 8

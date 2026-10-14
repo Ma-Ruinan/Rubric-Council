@@ -2,7 +2,7 @@
 description: 理解单道测试题目和源素材，制作或修订题目原生、证据可追溯的 rubric.md
 mode: all
 hidden: true
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 60

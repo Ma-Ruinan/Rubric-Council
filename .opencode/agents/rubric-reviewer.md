@@ -3,7 +3,7 @@
 description: 独立核查单道题目的候选 Rubric，发现题意偏差、不可计算原子、遗漏、重复扣分和时间不公平
 mode: all
 hidden: true
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 45

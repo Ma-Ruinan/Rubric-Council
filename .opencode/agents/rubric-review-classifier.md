@@ -3,7 +3,7 @@
 description: 独立复核 Reviewer 的 suggestions，防止影响评分的缺陷被错误放行
 mode: all
 hidden: true
-model: aiaaa/deepseek-v4.1-flash
+model: custom/deepseek-v4.1-flash
 variant: high
 temperature: 0.1
 steps: 30
