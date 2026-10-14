@@ -63,7 +63,7 @@ W2_研究报告/
 克隆当前提供自主运行入口的分支：
 
 ```bash
-git clone --branch release/2026-10-12-evidence-contract-v1 https://github.com/Ma-Ruinan/Rubric-Council.git
+git clone --branch main https://github.com/Ma-Ruinan/Rubric-Council.git
 cd Rubric-Council
 uv sync
 ```
